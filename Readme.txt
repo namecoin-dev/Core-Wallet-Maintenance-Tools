@@ -33,11 +33,12 @@
   -----------------
   1. EXPORT_descriptors.py - Export private descriptors of all owned names and UTXOs.
   2. IMPORT_descriptors_direct.py - Import the exported private descriptors directly into any descriptor wallet.
+  3. GET_privkey.py - Extract and verify the private key controlling Namecoin assets or wallet addresses.
 
 
   Prerequisites:
   -----------------
-  * Download and install Python from https://www.python.org/downloads/
+  * Download and install Python from python.org (https://www.python.org/downloads/).
   * Configure RPC credentials
 
 	On a fresh installation create (otherwise edit) the file "namecoin.conf" in your Namecoin data directory with minimal content:
@@ -51,7 +52,7 @@
 		rpccookiefile=.\.cookie
 		rpcuser=xxxxxxxxxxxxxxx
 		rpcpassword=xxxxxxxxxxx
-        fallbackfee=0.0002
+		fallbackfee=0.0002
 
 
 		macOS:
@@ -63,7 +64,7 @@
 		rpccookiefile=.cookie
 		rpcuser=xxxxxxxxxxxxxxx
 		rpcpassword=xxxxxxxxxxx
-        fallbackfee=0.0002
+		fallbackfee=0.0002
 
 	The parameter "fallbackfee" is a recommended setting for the fallback fee calculation (0.0002 NMC).
 	
@@ -79,11 +80,10 @@
 
 		macOS:
 		______
-		
-			Enable visibility with 'command chflags nohidden ~/Library' in the terminal before.
 
 			~/Library/Application Support/Namecoin/
 
+		Enable visibility with 'command chflags nohidden ~/Library' in the terminal before.
 
 		Linux:
 		______
@@ -161,7 +161,8 @@
   Usage:
   ------
   1. Set your RPC credentials (rpc_user, rpc_pass, url).
-  2. Run:
+
+  2. Click on EXPORT_descriptors.py, or run from the console with:
 
 	  python EXPORT_descriptors.py
 
@@ -187,7 +188,7 @@
   
 ====================================================================================
 
-  This tool imports theprivate descriptors directly derived by EXPORT_descriptors.py into any Namecoin Core descriptor wallet.
+  This tool imports the private descriptors directly derived by EXPORT_descriptors.py into any Namecoin Core descriptor wallet.
 
   It processes descriptors_names.txt and descriptors_utxos.txt (or descriptors_hd.txt in case of a full wallet recovery) automatically batching imports to prevent RPC size limits.
 
@@ -221,7 +222,7 @@
 
   2. Configure rpc_user, rpc_pass, and url near the top of the script.
 
-  3. Run:
+  3. Click on IMPORT_descriptors_direct.py, or run from the console with:
 
 	  python IMPORT_descriptors_direct.py
 
@@ -239,8 +240,60 @@
 
   Notes:
   ------
-  * The final descriptor triggers the full rescan.
+  * The final descriptor triggers a full blockchain rescan.
   * Ensure the target wallet is unlocked if encrypted.
+
+====================================================================================
+
+  GET_privkey.py
+  
+====================================================================================
+
+  This tool extracts the WIF private key stored in a Namecoin Core descriptor wallet. It supports both, assets imported by private keys and assets generated directly by descriptor wallets.
+
+  By default, private descriptors are read directly into process memory with listdescriptors true. The script checks HD descriptors first, then imported single keys. Before displaying a result, it rebuilds a private leaf descriptor and verifies it with the deriveaddresses RPC. For security reasons, the temporary descriptor data structure is cleared after processing on both success and error paths (best-effort).
+
+  Supported descriptor forms are single-key pkh, wpkh, sh(wpkh) and key-path-only tr. Multisig and watch-only wallets etc. are rejected. Although Taproot has not yet been activated on Namecoin, this script already handles Bech32m Taproot addresses (future-proofing).
+
+
+  Prerequisites:
+  --------------
+
+  * Namecoin Core must be running and the descriptor wallet must be loaded.
+  * This tool supports Namecoin mainnet only.
+  * namecoin-cli must be beside the script in the standard daemon directory.
+  * An encrypted wallet must be unlocked while live private descriptors are read.
+
+
+  Dependencies:
+  -------------
+  * ecdsa (elliptic curve key operations)
+  * Python standard libraries (hashlib, hmac, struct, etc.)
+  * To install the external libraries, run the following command in the console:
+
+	  pip install requests ecdsa
+
+  Usage:
+  ------
+  Run GET_privkey.py with hardcoded name (line 26 of the script). Alternatively, run in the console:
+
+	  python GET_privkey.py NAME_HEX
+
+	  python GET_privkey.py "d/example" --name-encoding ascii
+
+	  python GET_privkey.py --address ADDRESS
+
+
+  Options:
+  --------
+
+  Option				Description
+  -----------------------------		-------------------------------------------------------------
+  DEFAULT_NAME				Modify the name to inspect in line 26 of the script; hexadecimal by default.
+  NAME_HEX				Argument with name to inspect; hexadecimal by default. Cannot be combined with --address.
+  --name-encoding hex|ascii|utf8	Encoding passed explicitly to name_show.
+  --address ADDRESS			Inspect a Legacy P2PKH, nested SegWit or Bech32 wallet address instead of resolving a name.
+  --descriptors-file FILE		Use an existing private listdescriptors JSON export instead of reading descriptors live. Other validation still uses live RPC.
 
 ====================================================================================
 
@@ -254,5 +307,4 @@
   for any loss of funds, assets or data, or for any damage resulting
   from its use or misuse!
   
-
 ====================================================================================

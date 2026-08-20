@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import argparse
 import hashlib
 import hmac
@@ -15,7 +18,7 @@ import re
 import shutil
 import struct
 import subprocess
-import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,7 +26,8 @@ from typing import Any
 from ecdsa import SECP256k1, SigningKey
 
 
-DEFAULT_NAME = "642f6578616d706c65"  # 'd/example' hex encoded
+# ---------------- CONFIG ----------------
+DEFAULT_NAME = "642f74657374"  # 'd/test' hex encoded
 NAMECOIN_MAINNET_WIF_PREFIX = 0xB4
 HARDENED = 1 << 31
 CURVE_ORDER = SECP256k1.order
@@ -36,6 +40,22 @@ EXTENDED_PRIVATE_KEY_VERSIONS = {
 class ToolError(RuntimeError):
 	pass
 
+class RpcTransportError(ToolError):
+	pass
+
+def remove_bytecode_cache() -> None:
+	cache_directory = Path(__file__).resolve().parent / "__pycache__"
+	try:
+		if cache_directory.is_symlink():
+			cache_directory.unlink()
+		else:
+			shutil.rmtree(cache_directory)
+	except FileNotFoundError:
+		pass
+	except OSError:
+		print(f"[WARNING] Could not remove Python bytecode cache: {cache_directory}", file=sys.stderr)
+
+# ---------------- util: base58 ----------------
 def b58decode(value: str) -> bytes:
 	number = 0
 	try:
@@ -77,6 +97,7 @@ def private_key_to_wif(private_key: bytes, prefix: int, compressed: bool = True)
 	payload = bytes([prefix]) + private_key + (b"\x01" if compressed else b"")
 	return base58check_encode(payload)
 
+# ---------------- util: pubkey from priv / wif ----------------
 def decode_wif(value: str, expected_prefix: int | None = None) -> tuple[bytes, bool, int]:
 	payload = base58check_decode(value)
 	if len(payload) == 34 and payload[-1] == 1:
@@ -102,10 +123,11 @@ def public_keys_from_private(private_key: bytes) -> tuple[str, str]:
 	uncompressed = (b"\x04" + point).hex()
 	return compressed, uncompressed
 
+# ---------------- RPC helper ----------------
 def redact_error(text: str) -> str:
 	text = re.sub(r"[1-9A-HJ-NP-Za-km-z]{40,}", "<redacted-base58>", text)
 	text = re.sub(r"\b[0-9a-fA-F]{64,}\b", "<redacted-hex>", text)
-	return text.strip()
+	return " ".join(text.split())
 
 def cli_argument(value: Any) -> str:
 	if isinstance(value, bool):
@@ -139,11 +161,14 @@ def find_namecoin_cli() -> Path:
 	)
 
 class RpcClient:
-	def __init__(self, executable: Path):
+	def __init__(self, executable: Path, timeout: float | None = 180):
 		self.executable = executable
+		self.timeout = timeout
 
 	def call(self, method: str, *params: Any) -> Any:
 		command = [str(self.executable)]
+		if self.timeout is None:
+			command.append("-rpcclienttimeout=0")
 		command.extend(("-stdin", method))
 		stdin = "".join(f"{cli_argument(param)}\n" for param in params)
 
@@ -155,11 +180,12 @@ class RpcClient:
 				text=True,
 				encoding="utf-8",
 				errors="replace",
-				timeout=180,
+				timeout=self.timeout,
+				creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
 				check=False,
 			)
 		except (OSError, subprocess.TimeoutExpired) as exc:
-			raise ToolError(f"RPC call {method} failed: {exc}") from exc
+			raise RpcTransportError(f"RPC call {method} failed: {exc}") from exc
 
 		if completed.returncode != 0:
 			detail = redact_error(completed.stderr or completed.stdout)
@@ -167,12 +193,21 @@ class RpcClient:
 				detail = f"namecoin-cli exited with code {completed.returncode}"
 			raise ToolError(f"RPC call {method} failed: {detail}")
 
+		scalar_result = completed.stdout.strip()
+		if (
+			method == "getblockhash"
+			and len(completed.stdout.splitlines()) == 1
+			and re.fullmatch(r"[0-9a-fA-F]{64}", scalar_result)
+		):
+			return scalar_result
+
 		try:
 			return json.loads(completed.stdout)
 		except json.JSONDecodeError as exc:
 			# Never include stdout here: listdescriptors may contain private keys.
 			raise ToolError(f"RPC call {method} returned invalid JSON") from exc
 
+# ---------------- Descriptor parsing ----------------
 @dataclass(frozen=True)
 class SingleKeyDescriptor:
 	kind: str
@@ -187,10 +222,12 @@ class SingleKeyDescriptor:
 			return f"sh(wpkh({key}))"
 		if self.kind == "tr":
 			return f"tr({key})"
+		if self.kind == "combo":
+			return f"combo({key})"
 		raise ValueError(f"Unsupported descriptor kind: {self.kind}")
 
 def parse_single_key_descriptor(descriptor: str | None) -> SingleKeyDescriptor | None:
-	if not descriptor:
+	if not isinstance(descriptor, str) or not descriptor:
 		return None
 	body = descriptor.split("#", 1)[0]
 	if body.startswith("sh(wpkh(") and body.endswith("))"):
@@ -206,6 +243,9 @@ def parse_single_key_descriptor(descriptor: str | None) -> SingleKeyDescriptor |
 		key_expression = body[3:-1]
 		if key_expression and "," not in key_expression:  # No Taproot script tree.
 			return SingleKeyDescriptor("tr", key_expression)
+	if body.startswith("combo(") and body.endswith(")"):
+		key_expression = body[6:-1]
+		return SingleKeyDescriptor("combo", key_expression) if key_expression else None
 	return None
 
 def strip_key_origin(key_expression: str) -> tuple[str, str | None]:
@@ -219,6 +259,7 @@ def strip_key_origin(key_expression: str) -> tuple[str, str | None]:
 		raise ValueError("Invalid descriptor key origin")
 	return key_expression[closing + 1 :], origin
 
+# ---------------- util: BIP32 parse/derive ----------------
 @dataclass(frozen=True)
 class DerivationStep:
 	index: int | None
@@ -328,6 +369,7 @@ def parse_hd_index(path: str) -> int:
 		raise ToolError("HD address index is out of range")
 	return index
 
+# ---------------- Descriptor loading and cleanup ----------------
 def load_descriptors_from_file(path: Path) -> list[dict[str, Any]]:
 	try:
 		with path.open("r", encoding="utf-8") as handle:
@@ -370,6 +412,7 @@ def descriptor_range(entry: dict[str, Any]) -> tuple[int, int] | None:
 		return None
 	return (start, end) if 0 <= start <= end else None
 
+# ---------------- Build private descriptor from public and WIF ----------------
 def build_and_verify_leaf_descriptor(
 	rpc: RpcClient,
 	descriptor: SingleKeyDescriptor,
@@ -383,10 +426,11 @@ def build_and_verify_leaf_descriptor(
 		raise ToolError("getdescriptorinfo did not return a descriptor checksum")
 	private_descriptor = f"{body}#{checksum}"
 	derived = rpc.call("deriveaddresses", private_descriptor)
-	if isinstance(derived, list) and derived == [expected_address]:
+	if isinstance(derived, list) and expected_address in derived:
 		return private_descriptor
 	return None
 
+# ---------------- Find private key in HD descriptors ----------------
 @dataclass
 class ExtractionResult:
 	address: str
@@ -404,9 +448,14 @@ def find_hd_result(
 ) -> ExtractionResult | None:
 	embedded = address_info.get("embedded") if isinstance(address_info.get("embedded"), dict) else {}
 	hd_path = address_info.get("hdkeypath") or embedded.get("hdkeypath")
-	if not isinstance(hd_path, str) or hd_path in {"", "m"}:
-		return None
-	wildcard_index = parse_hd_index(hd_path)
+	wildcard_index = (
+		parse_hd_index(hd_path)
+		if isinstance(hd_path, str) and hd_path not in {"", "m"}
+		else None
+	)
+	target_descriptor = parse_single_key_descriptor(
+		address_info.get("desc") or embedded.get("desc") or address_info.get("parent_desc")
+	)
 
 	matches: list[ExtractionResult] = []
 	ordered = sorted(descriptors, key=lambda entry: not bool(entry.get("active")))
@@ -414,22 +463,37 @@ def find_hd_result(
 		ranged = descriptor_range(entry)
 		descriptor_text = entry.get("desc")
 		parsed = parse_single_key_descriptor(descriptor_text)
-		if ranged is None or parsed is None or not isinstance(descriptor_text, str):
+		if parsed is None or not isinstance(descriptor_text, str):
 			continue
 		extended = parse_extended_private_key(parsed.key_expression)
-		if extended is None or not any(step.index is None for step in extended.suffix):
-			continue
-		if not ranged[0] <= wildcard_index <= ranged[1]:
+		if extended is None:
 			continue
 
-		derived_addresses = rpc.call("deriveaddresses", descriptor_text, [wildcard_index, wildcard_index])
-		if derived_addresses != [address]:
+		has_wildcard = any(step.index is None for step in extended.suffix)
+		if has_wildcard:
+			if wildcard_index is None or ranged is None:
+				continue
+			if not ranged[0] <= wildcard_index <= ranged[1]:
+				continue
+			derived_addresses = rpc.call(
+				"deriveaddresses", descriptor_text, [wildcard_index, wildcard_index]
+			)
+			derivation_index = wildcard_index
+		else:
+			derived_addresses = rpc.call("deriveaddresses", descriptor_text)
+			derivation_index = 0
+		if not isinstance(derived_addresses, list) or address not in derived_addresses:
 			continue
 
-		child_path = resolve_derivation_path(extended.suffix, wildcard_index)
+		child_path = resolve_derivation_path(extended.suffix, derivation_index)
 		private_key = derive_private_key(extended, child_path)
 		wif = private_key_to_wif(private_key, wif_prefix, compressed=True)
-		leaf_descriptor = build_and_verify_leaf_descriptor(rpc, parsed, wif, address)
+		leaf_template = (
+			target_descriptor
+			if parsed.kind == "combo" and target_descriptor is not None and target_descriptor.kind != "combo"
+			else parsed
+		)
+		leaf_descriptor = build_and_verify_leaf_descriptor(rpc, leaf_template, wif, address)
 		if leaf_descriptor:
 			matches.append(
 				ExtractionResult(address, wif, leaf_descriptor, "internally generated HD descriptor", hd_path)
@@ -440,6 +504,7 @@ def find_hd_result(
 		raise ToolError("More than one HD private key matched the target address")
 	return next(iter(unique.values()), None)
 
+# ---------------- Find imported private key ----------------
 def collect_target_pubkeys(address_info: dict[str, Any]) -> set[str]:
 	candidates: list[Any] = [address_info.get("pubkey")]
 	embedded = address_info.get("embedded")
@@ -483,7 +548,7 @@ def find_imported_result(
 		return None
 
 	target_descriptor = parse_single_key_descriptor(
-		address_info.get("parent_desc") or address_info.get("desc")
+		address_info.get("desc") or address_info.get("parent_desc")
 	)
 	target_kind = target_descriptor.kind if target_descriptor else None
 	checked = 0
@@ -491,7 +556,7 @@ def find_imported_result(
 
 	for entry in descriptors:
 		parsed = parse_single_key_descriptor(entry.get("desc"))
-		if parsed is None or (target_kind and parsed.kind != target_kind):
+		if parsed is None or (target_kind and parsed.kind not in {target_kind, "combo"}):
 			continue
 		try:
 			without_origin, _origin = strip_key_origin(parsed.key_expression)
@@ -508,7 +573,12 @@ def find_imported_result(
 				print(f"  {checked:,} imported single keys checked ...")
 			continue
 
-		leaf_descriptor = build_and_verify_leaf_descriptor(rpc, parsed, without_origin, address)
+		leaf_template = (
+			target_descriptor
+			if parsed.kind == "combo" and target_descriptor is not None and target_descriptor.kind != "combo"
+			else parsed
+		)
+		leaf_descriptor = build_and_verify_leaf_descriptor(rpc, leaf_template, without_origin, address)
 		if leaf_descriptor:
 			matches.append(
 				ExtractionResult(address, without_origin, leaf_descriptor, "imported single key")
@@ -519,6 +589,7 @@ def find_imported_result(
 		raise ToolError("More than one imported private key matched the target address")
 	return next(iter(unique.values()), None)
 
+# ---------------- Network and target resolution ----------------
 def network_wif_prefix(rpc: RpcClient) -> tuple[str, int]:
 	info = rpc.call("getblockchaininfo")
 	chain = info.get("chain") if isinstance(info, dict) else None
@@ -555,6 +626,7 @@ def resolve_target_address(rpc: RpcClient, args: argparse.Namespace) -> str:
 		raise ToolError("The current name output is not owned by the loaded wallet")
 	return name_info["address"]
 
+# ---------------- Extraction workflow ----------------
 def extract(args: argparse.Namespace) -> ExtractionResult:
 	cli = find_namecoin_cli()
 	rpc = RpcClient(cli)
@@ -612,6 +684,7 @@ def extract(args: argparse.Namespace) -> ExtractionResult:
 		if had_descriptor_data:
 			print("Temporary private descriptor data released (best-effort).")
 
+# ---------------- CLI ----------------
 def build_parser() -> argparse.ArgumentParser:
 	parser = argparse.ArgumentParser(
 		description="Export the WIF private key controlling a Namecoin name or wallet address."
@@ -642,6 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
 	return parser
 
 def main() -> int:
+	remove_bytecode_cache()
 	args = build_parser().parse_args()
 	try:
 		result = extract(args)
@@ -658,5 +732,33 @@ def main() -> int:
 	print("WARNING: These values can be used to transfer funds or assets. Do not share or log them!")
 	return 0
 
+def should_wait_for_close() -> bool:
+	if len(sys.argv) != 1 or sys.stdin is None or sys.stdout is None:
+		return False
+	try:
+		return sys.stdin.isatty() and sys.stdout.isatty()
+	except (AttributeError, OSError, ValueError):
+		return False
+
+def wait_for_close() -> None:
+	if not should_wait_for_close():
+		return
+	try:
+		input("\nPress Enter to close ...")
+	except (EOFError, KeyboardInterrupt, OSError, ValueError):
+		pass
+
+def run_cli() -> int:
+	try:
+		exit_code = main()
+	except KeyboardInterrupt:
+		print("\nOperation cancelled.", file=sys.stderr)
+		exit_code = 130
+	except Exception:
+		traceback.print_exc()
+		exit_code = 1
+	wait_for_close()
+	return exit_code
+
 if __name__ == "__main__":
-	raise SystemExit(main())
+	raise SystemExit(run_cli())

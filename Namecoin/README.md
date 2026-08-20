@@ -17,6 +17,12 @@
 
 	C:\Program Files\Namecoin\daemon
 
+  Windows Folder Permission:
+  --------------------------
+  On Windows 11, `C:\Program Files` is protected by default. Open Command Prompt or PowerShell as Administrator and grant the local account full control over the daemon folder before running the tools:
+
+	icacls "C:\Program Files\Namecoin\daemon" /grant "Administrator:(OI)(CI)F" /T
+
   On-chain Archive:
   -----------------
   [nft/Core_wallet_maintenance.zip](https://namecoin.online/explorer/details.php?q=nft%2FCore_wallet_maintenance.zip)
@@ -24,60 +30,52 @@
   Included Scripts:
   -----------------
   1. **EXPORT_descriptors.py** – Export private descriptors of all owned names and UTXOs.
-  2. **IMPORT_descriptors_direct.py** – Import the exported private descriptors directly into any descriptor wallet.
+  2. **IMPORT_descriptors_direct.py** – Import the exported private descriptors directly into an eligible descriptor wallet.
   3. **GET_privkey.py** – Extract and verify the private key controlling Namecoin assets or wallet addresses.
 
   Prerequisites:
   --------------
   * Download and install Python from [python.org](https://www.python.org/downloads/).
-  * Configure RPC credentials
+  * Exactly one Namecoin Core descriptor wallet must be loaded.
+  * Keep `GET_privkey.py` beside the export and import tools since its descriptor routines are shared.
+  * `namecoin-cli` must be beside the scripts, or available on `PATH`.
+  * The importer and `GET_privkey.py` use `namecoin-cli` with normal cookie or `namecoin.conf` authentication.
+  * Encrypted wallets need to be unlocked.
 
 	On a fresh installation create (otherwise edit) the file `namecoin.conf` in your Namecoin data directory with minimal content:
 
-	Windows:
-	_______
-
 		server=1
 		rpcallowip=127.0.0.1
 		rpcbind=127.0.0.1
-		rpccookiefile=.\.cookie
-		rpcuser=xxxxxxxxxxxxxxx
-		rpcpassword=xxxxxxxxxxx
-        fallbackfee=0.0002
+		fallbackfee=0.0001
 
-	macOS:
-	______
+	This minimal configuration uses cookie authentication to be used on the local machine. The parameter `fallbackfee` is a recommended setting for the fallback fee calculation (`0.0001` NMC).
 
-		server=1
-		rpcallowip=127.0.0.1
-		rpcbind=127.0.0.1
-		rpccookiefile=.cookie
-		rpcuser=xxxxxxxxxxxxxxx
-		rpcpassword=xxxxxxxxxxx
-        fallbackfee=0.0002
+	You can also just copy the configuration file predefined in this package.
 
-      The parameter `fallbackfee` is a recommended setting for the fallback fee calculation (`0.0002` NMC).
+	Data directory locations:
 
-      You can also just copy the configuration file predefined in the `config` folder in this package.
+		Windows (fresh Core v0.28 or newer installation):
+		________________________________________________
 
-	  Data directory locations:
+			%LocalAppData%\Namecoin
 
-	Windows:
-	_______
+		Windows (existing legacy data directory):
+		_________________________________________
 
-			  %AppData%\Namecoin
+			%AppData%\Namecoin
 
-	macOS:
-	______
 
-			  ~/Library/Application Support/Namecoin/
+		macOS (enable visibility with 'command chflags nohidden ~/Library' in the terminal before):
+		___________________________________________________________________________________________
 
-	Enable visibility with `command chflags nohidden ~/Library` in the terminal before.
+			~/Library/Application Support/Namecoin/
 
-	Linux:
-	______
 
-			  $HOME/.namecoin/
+		Linux:
+		______
+
+			$HOME/.namecoin/
 
 ---
 
@@ -90,12 +88,11 @@
 
   1. **Keys that were imported from legacy wallets**
 
-	  Assets imported via raw private keys (by constructing descriptors using the Core Wallet Migration Tools) appear as **simple single-key descriptors** (`wpkh(pubkey)`, `pkh(pubkey)`, ...) and need to be exported by **replacing the public key inside the descriptor with the derived WIF private key**.
+	  Assets imported via raw private keys (by constructing descriptors using the Core Wallet Migration Tools) appear as **simple single-key descriptors** (`wpkh(pubkey)`, `pkh(pubkey)`, ...) and need to be exported by **replacing the public key inside the descriptor with the derived WIF private key**. Their private WIF keys are matched to the corresponding wallet addresses.
 
   2. **Keys that were generated internally through descriptor-based key derivation**
 
-	  These appear as **HD descriptors** with origin information and derivation paths (e.g. `[fingerprint/84h/.../0/*]xpub…`).
-	  They are exported by **deriving the corresponding child private key from the master key**, rebuilding the descriptor with the private key.
+	  These appear as **HD descriptors** with origin information and derivation paths (e.g. `[fingerprint/84h/.../0/*]xpub...`). Private child keys are derived from the matching ranged xprv descriptor and concrete HD index. The resulting private leaf descriptor is verified against the expected address.
 
   The script automatically distinguishes between imported keys and descriptor-derived keys and exports valid private descriptors for both.
 
@@ -103,31 +100,37 @@
   -------------
   ### Address Collection
 
-  * Retrieves owned Namecoin assets (names) via `name_list`RPC (filtering for `ismine=true`).
-  * Retrieves all wallet-controlled UTXOs (funds) via `listunspent` RPC.
+  * Retrieves owned Namecoin assets (names) via `name_list` RPC (filtering for `ismine=true`).
+  * Rechecks every `ismine` candidate with the `name_show` RPC. This protects the export from stale `name_list` ownership data after multiple name updates in one block.
+  * Retrieves current UTXOs for which `listunspent 0` reports both `spendable=true` and `solvable=true` (the wallet knows the spending script and has the its private keys).
+  * Intentionally uses one HTTP session with credentials, with one RPC call at a time, in order to efficiently request and verify thousands of name and currency outputs.
+  * Stores the block height of the oldest transaction output of the exported UTXOs in the `rescan_start.json` file (with a safety buffer of six preceding blocks), to be processed by the `IMPORT_descriptors_direct.py` tool.
 
   ### Safety & Validation
 
-  * **Double pubkey validation**:
-	  After deriving a private key, the script regenerates both compressed and uncompressed pubkeys to ensure an exact match with the wallet's `getaddressinfo` RPC result.
+  * **Two-stage key validation**:
+	  After deriving a private key, the script regenerates both compressed and uncompressed pubkeys to ensure an exact match with the wallet's `getaddressinfo` RPC result. HD candidates are additionally checked by deriving their source descriptor.
 
   * **Secure ephemeral handling**:
 	  xprv strings are cleared from memory after processing (best-effort).
 
   * **Full error logging**:
-	  Failed extractions (e.g., from orphaned names that were transferred out) are logged for manual review.
+	  Name and UTXO inventory or extraction failures are logged for manual review. Stale `name_list` candidates that authoritative `name_show` reports as no longer owned are skipped.
 
   Output Files:
   -------------
-  | File| Contains|
+  | File | Contains |
   | ----------------------- | ------------------------------------------------------------- |
-  | `descriptors_hd.txt`| Private descriptors derived from xprv roots (deduplicated). |
-  | `descriptors_names.txt` | Private descriptors for all owned names (imported + derived). |
-  | `descriptors_utxos.txt` | Private descriptors for all spendable UTXO addresses. |
-  | `unextracted_names.txt` | Names whose keys could not be extracted.|
-  | `unextracted_utxos.txt` | UTXO addresses whose keys could not be extracted. |
+  | `descriptors_hd.txt` | Private ranged/root descriptors containing xprvs and import metadata (deduplicated JSONL). |
+  | `descriptors_names.txt` | Deduplicated private leaf descriptors for currently owned names (one plain descriptor per CRLF-terminated line). |
+  | `descriptors_utxos.txt` | Private leaf descriptor import records for current spendable UTXO addresses (deduplicated JSONL). |
+  | `rescan_start.json` | Four-field rescan metadata for the matching import. |
+  | `unextracted_names.txt` | Name inventory or key-extraction failures (created only when non-empty). |
+  | `unextracted_utxos.txt` | UTXO records or addresses whose inventory or key extraction failed (created only when non-empty). |
 
-  The `descriptors_hd.txt` file contains primary private descriptors that include the extended private key (xprv), which is effectively the master key, including derived extended keys retrieved from the wallet's hierarchical structure. Use this output for a complete wallet recovery.
+  Descriptor and error output files are written only when non-empty; stale files for empty categories are removed. The matching `rescan_start.json` is always written on a successful export.
+
+  The `descriptors_hd.txt` file contains private ranged/root descriptors that include extended private keys (xprvs), which are effectively master or derived extended keys retrieved from the wallet's hierarchical structure. Use this output for a complete wallet recovery. However, this output does not include previously imported, externally generated single-key descriptors resp. their private keys!
 
   However, to get rid of outdated and orphaned wallet entries, only the descriptors from the `descriptors_names.txt` and `descriptors_utxos.txt` outputs are to be taken for the import to a fresh wallet.
 
@@ -142,23 +145,26 @@
 
   Usage:
   ------
-  1. Set your RPC credentials (`rpc_user`, `rpc_pass`, `url`).
-  2. Click on `EXPORT_descriptors.py`, or run from the console with:
+  1. Click on `EXPORT_descriptors.py`, or run from the console with:
 
 	python EXPORT_descriptors.py
 
-  3. The extracted private descriptors will be written to the output files.
+  2. The extracted private descriptors will be written to the output files.
+
+  3. The exporter setting `COOKIE_FILE = None` auto-detects the cookie file. For a custom data directory or startup-parameter setup, set `COOKIE_FILE` to the cookie-file path; absolute and relative paths to the script directory are supported.
+
+  4. If you have configured another RPC port than the standard port, adjust the `url` parameter in the header (line 79 of the script).
 
   Important Warnings:
   -------------------
-  * **This script exposes private keys. Only run it on a trusted machine!**
+  * **This script exposes private keys and descriptors. Only run it on a trusted machine!**
   * **Never share the output files!**
   * **Always maintain wallet backups!**
 
   Limitations:
   ------------
-  * Assumes Namecoin's WIF prefix (`\xb4`).
-  * Supports the most common descriptor forms. For additional types (e.g. multisig support `wsh(multi(...))`), replace the code comments if required.
+  * Intentionally supports Namecoin mainnet and its WIF prefix (`\xb4`) only.
+  * Supports the single-key descriptor forms `pkh`, `wpkh`, `sh(wpkh)`, key-path-only `tr`, and `combo`. Additional types (e.g. multisig support `wsh(multi(...))`) remain restorable through the root descriptors in `descriptors_hd.txt`.
 
 ---
 
@@ -166,16 +172,13 @@
 
 ---
 
-  This tool imports the private descriptors directly derived by `EXPORT_descriptors.py` into any Namecoin Core **descriptor wallet**.
-
-  It processes `descriptors_names.txt` and `descriptors_utxos.txt` (or `descriptors_hd.txt` in case of a full wallet recovery) automatically batching imports to prevent RPC size limits.
+  This tool imports the private descriptors directly derived by `EXPORT_descriptors.py` into a Namecoin Core **descriptor wallet**. It processes the descriptor files selected in `DESCRIPTOR_FILES` and automatically batches imports to prevent RPC size limits.
 
   Features:
   ---------
-  * **Automatic file detection**
+  * **Configured file detection**
 
-	Imports all descriptor files present.
-	The final descriptor triggers a complete blockchain rescan needed to reconstruct the wallet.
+	Imports all descriptor files present. Requires the matching `rescan_start.json` generated by the exporter.
 
   * **Batch import**
 
@@ -187,16 +190,32 @@
 
   * **Timestamp control**
 
-	You may set `RESCAN_TIMESTAMP = 0` to the UNIX timestamp of the oldest active update for a faster rescan.
+	Once the import is completed, the tool rescans the blockchain, starting six blocks ahead of the oldest transaction output of the imported UTXOs (retrieved from `rescan_start.json` generated by `EXPORT_descriptors.py`). No manual setting needed.
+
+  * **Temporary-data cleanup**
+
+	Releases in-memory descriptor and RPC result structures after processing (best-effort).
 
   Usage:
   ------
-  1. Ensure that the exported files exist in the same folder, e.g.:
+  1. Keep the desired exported files and the matching `rescan_start.json` beside the scripts inside `DATA_DIRECTORY`, e.g.:
 
+	descriptors_hd.txt
 	descriptors_names.txt
 	descriptors_utxos.txt
+	rescan_start.json
 
-  2. Configure `rpc_user`, `rpc_pass`, and `url` near the top of the script.
+  2. Select the input files in the header of the script (line 43). The default is a full recovery, in this order:
+
+	DESCRIPTOR_FILES = ["descriptors_hd.txt", "descriptors_names.txt", "descriptors_utxos.txt"]
+
+  The metadata file `rescan_start.json` is required independently and must not be added to `DESCRIPTOR_FILES`.
+
+  Note: Create an empty wallet in order to be able to import the root descriptors from `descriptors_hd.txt`, else the script will abort the import and throw an error message!
+
+  To migrate current names and spendable UTXOs only without restoring the ranged HD generation state, use:
+
+	DESCRIPTOR_FILES = ["descriptors_names.txt", "descriptors_utxos.txt"]
 
   3. Click on `IMPORT_descriptors_direct.py`, or run from the console with:
 
@@ -204,18 +223,21 @@
 
   4. The script will automatically:
 
-	  * Load the descriptor files
-	  * Batch the imports
-	  * Wait for each rescan to complete
-	  * Import all descriptors
+	  * Validate the loaded wallet and `rescan_start.json` before importing
+	  * Load the selected descriptor files
+	  * Preflight and immediately import each batch of up to 1000 records
+	  * Validate each batch result before displaying its progress
+	  * Perform one final rescan after all batches succeeded
 
-  5. Once finished, it displays:
+  5. On each finished step, it displays:
 
-	[INFO] All descriptors imported successfully.
+	[INFO] All <count> descriptor records imported successfully.
+	[INFO] Rescan completed through block <height>.
 
   Notes:
   ------
-  * The final descriptor triggers a full blockchain rescan.
+  * The final rescan starts at the safe block height recorded by the export tool. It intentionally does not reconstruct historical transactions before that height. This helps reduce the size of the wallet to one third compared to a full blockchain rescan.
+  * Wait at least 15 blocks (two hours) after your last wallet transactions to avoid a rescan of the most recent transactions during each batch import.
   * Ensure the target wallet is unlocked if encrypted.
 
 ---
@@ -228,11 +250,10 @@
 
   By default, private descriptors are read directly into process memory with `listdescriptors true`. The script checks HD descriptors first, then imported single keys. Before displaying a result, it rebuilds a private leaf descriptor and verifies it with the `deriveaddresses` RPC. For security reasons, the temporary descriptor data structure is cleared after processing on both success and error paths (best-effort).
 
-  Supported descriptor forms are single-key `pkh`, `wpkh`, `sh(wpkh)` and key-path-only `tr`. Multisig and watch-only wallets etc. are rejected. Although Taproot has not yet been activated on Namecoin, this script already handles Bech32m Taproot addresses (future-proofing).
+  Supported descriptor forms are single-key `pkh`, `wpkh`, `sh(wpkh)`, key-path-only `tr`, and `combo`. Multisig and watch-only wallets etc. are rejected. Although Taproot has not yet been activated on Namecoin, this script already handles Bech32m Taproot addresses (future-proofing).
 
   Prerequisites:
   --------------
-
   * Namecoin Core must be running and the descriptor wallet must be loaded.
   * This tool supports Namecoin mainnet only.
   * `namecoin-cli` must be beside the script in the standard daemon directory.
@@ -244,15 +265,15 @@
   * Python standard libraries (`hashlib`, `hmac`, `struct`, etc.)
   * To install the external libraries, run the following command in the console:
 
-		pip install requests ecdsa
+		pip install ecdsa
 
   Usage:
   ------
-  Run `GET_privkey.py` with hardcoded name (line 26 of the script). Alternatively, run in the console:
-  
+  Run `GET_privkey.py` with the hardcoded `DEFAULT_NAME` (line 30 of the script). Alternatively, run in the console:
+
 	python GET_privkey.py NAME_HEX
 
-	python GET_privkey.py "d/example" --name-encoding ascii
+	python GET_privkey.py "d/test" --name-encoding ascii
 
 	python GET_privkey.py --address ADDRESS
 
@@ -261,7 +282,7 @@
 
   | Option | Description |
   | --- | --- |
-  | `DEFAULT_NAME` | Modify the name to inspect in line 26 of the script; hexadecimal by default. |
+  | `DEFAULT_NAME` | Modify the hardcoded name to inspect; hexadecimal by default. |
   | `NAME_HEX` | Argument with name to inspect; hexadecimal by default. Cannot be combined with `--address`. |
   | `--name-encoding hex\|ascii\|utf8` | Encoding passed explicitly to `name_show`. |
   | `--address ADDRESS` | Inspect a Legacy P2PKH, nested SegWit or Bech32 wallet address instead of resolving a name. |

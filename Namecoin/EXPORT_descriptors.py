@@ -4,484 +4,1388 @@
 
 ################################################################################################################
 
-import requests
-import re
-import hashlib
-import hmac
-import struct
-import binascii
-from ecdsa import SigningKey, SECP256k1
-from collections import defaultdict
+from __future__ import annotations
 
-# ---------------- CONFIG ----------------
-rpc_user = "XXXXXXX"  # rpcuser from namecoin.conf
-rpc_pass = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # rpcpassword from namecoin.conf
+import sys
+sys.dont_write_bytecode = True
+
+def configure_standard_streams() -> None:
+	for stream_name in ("stdout", "stderr"):
+		stream = getattr(sys, stream_name, None)
+		try:
+			stream.reconfigure(errors="replace")
+		except (AttributeError, OSError, TypeError, ValueError):
+			pass
+
+configure_standard_streams()
+
+import hashlib
+import json
+import os
+import platform
+import secrets
+import stat
+import traceback
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+try:
+	import requests
+except ImportError as exc:
+	failed_import = getattr(exc, "name", None)
+	safe_import_name = (
+		isinstance(failed_import, str)
+		and 0 < len(failed_import) <= 128
+		and failed_import.isascii()
+		and all(part and part.replace("_", "").isalnum() for part in failed_import.split("."))
+	)
+	dependency_note = f" (failed import: {failed_import})" if safe_import_name else ""
+	print(
+		"ERROR: The required Python package 'requests' or one of its dependencies "
+		f"could not be imported{dependency_note}. Repair it with: "
+		"python -m pip install --upgrade --force-reinstall requests",
+		file=sys.stderr,
+	)
+	if len(sys.argv) == 1 and sys.stdin is not None and sys.stdout is not None:
+		try:
+			if sys.stdin.isatty() and sys.stdout.isatty():
+				input("\nPress Enter to close ...")
+		except (AttributeError, EOFError, KeyboardInterrupt, OSError, ValueError):
+			pass
+	raise SystemExit(1) from None
+
+from GET_privkey import (
+	ExtractionResult,
+	RpcTransportError,
+	ToolError,
+	clear_private_descriptor_data,
+	collect_target_pubkeys,
+	decode_wif,
+	descriptor_range,
+	find_hd_result,
+	find_imported_result,
+	network_wif_prefix,
+	parse_extended_private_key,
+	parse_single_key_descriptor,
+	public_keys_from_private,
+	redact_error,
+	remove_bytecode_cache,
+	strip_key_origin,
+	wait_for_close,
+)
+
+
 url = "http://127.0.0.1:8336/"
 
-session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=4, max_retries=3, pool_block=False)
-session.mount(url, adapter)
-session.auth = (rpc_user, rpc_pass)
-session.headers.update({"Content-Type": "application/json"})
-session.timeout = 30
+SCRIPT_DIR = Path(__file__).resolve().parent
+# None = auto-detect; a custom cookie path may be absolute or relative to the script directory.
+COOKIE_FILE: str | Path | None = None
+DATA_DIRECTORY = SCRIPT_DIR
+HD_OUTPUT_FILE = DATA_DIRECTORY / "descriptors_hd.txt"
+NAME_OUTPUT_FILE = DATA_DIRECTORY / "descriptors_names.txt"
+UTXO_OUTPUT_FILE = DATA_DIRECTORY / "descriptors_utxos.txt"
+RESCAN_METADATA_FILE = DATA_DIRECTORY / "rescan_start.json"
+UNEXTRACTED_NAME_FILE = DATA_DIRECTORY / "unextracted_names.txt"
+UNEXTRACTED_UTXO_FILE = DATA_DIRECTORY / "unextracted_utxos.txt"
+RESCAN_METADATA_FORMAT = "core-wallet-maintenance-rescan-start-v1"
+RECENT_BLOCK_RESCAN_MARGIN = 6
+EXCLUSIVE_CREATE_ATTEMPTS = 32
+RPC_CONNECT_TIMEOUT = 10
+RPC_READ_TIMEOUT = 180
+MAX_COOKIE_FILE_BYTES = 4096
+MISSING_COOKIE_ERROR = (
+	"RPC cookie file not found; make sure the intended Core instance is running, no hardcoded "
+	"rpcuser/rpcpassword credentials are set in namecoin.conf, and the configured or expected "
+	"cookie path is correct"
+)
 
-NAMECOIN_WIF_PREFIX = b'\xb4'
-B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 
-# ---------------- util: base58 ----------------
-def b58decode(s: str) -> bytes:
-    n = 0
-    for ch in s:
-        n = n * 58 + B58_ALPHABET.index(ch)
-    full = n.to_bytes((n.bit_length() + 7) // 8, 'big') if n != 0 else b''
-    leading = 0
-    for ch in s:
-        if ch == B58_ALPHABET[0]:
-            leading += 1
-        else:
-            break
-    return b'\x00' * leading + full
+def get_cookie_path() -> Path:
+	if COOKIE_FILE is not None:
+		configured_path = Path(COOKIE_FILE)
+		return configured_path if configured_path.is_absolute() else SCRIPT_DIR / configured_path
 
-def b58encode(b: bytes) -> str:
-    n = int.from_bytes(b, "big")
-    res = bytearray()
-    while n > 0:
-        n, r = divmod(n, 58)
-        res.append(ord(B58_ALPHABET[r]))
-    leading = 0
-    for c in b:
-        if c == 0:
-            leading += 1
-        else:
-            break
-    if res:
-        return B58_ALPHABET[0] * leading + bytes(reversed(res)).decode()
-    else:
-        return B58_ALPHABET[0] * leading
+	home = Path.home()
+	system = platform.system()
 
-def base58check_decode(s: str) -> bytes:
-    raw = b58decode(s)
-    if len(raw) < 5:
-        raise ValueError("Too short for base58check")
-    payload, chk = raw[:-4], raw[-4:]
-    if hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4] != chk:
-        raise ValueError("Invalid checksum")
-    return payload
+	if system == "Windows":
+		roaming_directory = Path(
+			os.environ.get("APPDATA") or home / "AppData/Roaming"
+		) / "Namecoin"
+		if roaming_directory.is_dir():
+			return roaming_directory / ".cookie"
+		return Path(
+			os.environ.get("LOCALAPPDATA") or home / "AppData/Local"
+		) / "Namecoin/.cookie"
+	elif system == "Darwin": # macOS (Darwin)
+		return home / "Library/Application Support/Namecoin/.cookie"
+	else: # Linux and other Unix-like systems
+		return home / ".namecoin/.cookie"
 
-def base58check_encode(payload: bytes) -> str:
-    chk = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
-    return b58encode(payload + chk)
+def is_windows_reparse_point(file_status: os.stat_result) -> bool:
+	attributes = getattr(file_status, "st_file_attributes", 0)
+	reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+	return bool(attributes & reparse_attribute)
 
-def priv_to_wif(priv_bytes: bytes, compressed=True) -> str:
-    payload = NAMECOIN_WIF_PREFIX + priv_bytes
-    if compressed:
-        payload += b'\x01'
-    return base58check_encode(payload)
+def read_rpc_cookie(cookie_path: Path) -> tuple[str, str]:
+	raw_cookie = bytearray(MAX_COOKIE_FILE_BYTES + 1)
+	raw_length = 0
+	file_descriptor: int | None = None
+	cookie_file: Any = None
+	cookie_text = ""
+	rpc_user = ""
+	rpc_pass = ""
+	try:
+		try:
+			path_status = os.lstat(cookie_path)
+		except FileNotFoundError:
+			raise ToolError(MISSING_COOKIE_ERROR) from None
+		except OSError:
+			raise ToolError("Could not securely inspect the RPC cookie file") from None
 
-# ---------------- util: pubkey from priv / wif ----------------
-def compute_pubkey_from_priv(priv: bytes, compressed=True):
-    sk = SigningKey.from_string(priv, curve=SECP256k1)
-    vk = sk.verifying_key
-    if compressed:
-        prefix = b'\x02' if vk.to_string()[-1] % 2 == 0 else b'\x03'
-        return (prefix + vk.to_string()[:32]).hex()
-    else:
-        return '04' + vk.to_string().hex()
+		if (
+			stat.S_ISLNK(path_status.st_mode)
+			or is_windows_reparse_point(path_status)
+			or not stat.S_ISREG(path_status.st_mode)
+		):
+			raise ToolError("The RPC cookie path is not a secure regular file") from None
 
-def compute_pubkey_from_wif(wif: str):
-    dec = base58check_decode(wif)
-    priv = dec[1:]
-    compressed = False
-    if len(priv) == 33 and priv[-1] == 1:
-        priv = priv[:-1]
-        compressed = True
-    return compute_pubkey_from_priv(priv, compressed)
+		open_flags = os.O_RDONLY
+		for flag_name in ("O_BINARY", "O_CLOEXEC", "O_NOINHERIT", "O_NOFOLLOW", "O_NONBLOCK"):
+			open_flags |= getattr(os, flag_name, 0)
+		try:
+			file_descriptor = os.open(cookie_path, open_flags)
+		except FileNotFoundError:
+			raise ToolError(MISSING_COOKIE_ERROR) from None
+		except OSError:
+			raise ToolError("Could not securely open the RPC cookie file") from None
 
-# ---------------- util: BIP32 parse/derive ----------------
-def parse_path(path_str: str):
-    if not path_str:
-        return []
-    if path_str.startswith('m'):
-        path_str = path_str[1:]
-        if path_str.startswith('/'):
-            path_str = path_str[1:]
-    parts = path_str.split('/') if path_str else []
-    path = []
-    for p in parts:
-        if not p:
-            continue
-        hardened = p.endswith('h') or p.endswith("'") or p.endswith("H")
-        if hardened:
-            p = p[:-1]
-        try:
-            idx = int(p)
-        except Exception:
-            continue
-        if hardened:
-            idx += 2**31
-        path.append(idx)
-    return path
+		try:
+			opened_status = os.fstat(file_descriptor)
+		except OSError:
+			raise ToolError("Could not securely inspect the open RPC cookie file") from None
+		if (
+			not stat.S_ISREG(opened_status.st_mode)
+			or is_windows_reparse_point(opened_status)
+			or not os.path.samestat(path_status, opened_status)
+		):
+			raise ToolError("The RPC cookie file changed while it was being opened") from None
+		if not 1 <= opened_status.st_size <= MAX_COOKIE_FILE_BYTES:
+			raise ToolError("The RPC cookie file has an invalid size") from None
 
-def base58check_decode_quiet(s: str):
-    try:
-        return base58check_decode(s)
-    except Exception:
-        return None
+		try:
+			cookie_file = os.fdopen(file_descriptor, "rb", buffering=0)
+			file_descriptor = None
+			cookie_view = memoryview(raw_cookie)
+			try:
+				while raw_length < len(raw_cookie):
+					cookie_chunk_view = cookie_view[raw_length:]
+					try:
+						read_count = cookie_file.readinto(cookie_chunk_view)
+					finally:
+						cookie_chunk_view.release()
+						cookie_chunk_view = None
+					if not read_count:
+						break
+					raw_length += read_count
+			finally:
+				cookie_view.release()
+				cookie_view = None
+		except OSError:
+			raise ToolError("Could not securely read the RPC cookie file") from None
+		if not 1 <= raw_length <= MAX_COOKIE_FILE_BYTES:
+			raise ToolError("The RPC cookie file has an invalid size") from None
 
-def compute_fingerprint_from_xprv(xprv: str):
-    dec = base58check_decode_quiet(xprv)
-    if not dec or len(dec) != 78:
-        return None
-    key = dec[45:]
-    if key[0] != 0:
-        return None
-    priv = key[1:]
-    pub = compute_pubkey_from_priv(priv)
-    h = hashlib.sha256(bytes.fromhex(pub)).digest()
-    rip = hashlib.new('ripemd160', h).digest()
-    return rip[:4].hex()
+		content_length = raw_length
+		if raw_cookie[content_length - 1] == 0x0A:
+			content_length -= 1
+			if content_length and raw_cookie[content_length - 1] == 0x0D:
+				content_length -= 1
+		if content_length == 0:
+			raise ToolError("The RPC cookie file has invalid contents") from None
+		if any(
+			raw_cookie[index] < 0x20 or raw_cookie[index] > 0x7E
+			for index in range(content_length)
+		):
+			raise ToolError("The RPC cookie file has invalid contents") from None
 
-def derive_priv(xpriv: str, relative_path: list):
-    dec = base58check_decode_quiet(xpriv)
-    if not dec or len(dec) != 78:
-        return None
-    chaincode = dec[13:45]
-    key = dec[45:]
-    if key[0] != 0:
-        return None
-    current_priv = key[1:]
-    current_chaincode = chaincode
-    for idx in relative_path:
-        hardened = idx >= 2**31
-        if hardened:
-            data = b'\x00' + current_priv + struct.pack(">I", idx)
-        else:
-            sk = SigningKey.from_string(current_priv, curve=SECP256k1)
-            vk = sk.verifying_key
-            prefix = b'\x02' if vk.to_string()[-1] % 2 == 0 else b'\x03'
-            pub = prefix + vk.to_string()[:32]
-            data = pub + struct.pack(">I", idx)
-        I = hmac.new(current_chaincode, data, hashlib.sha512).digest()
-        Il, Ir = I[:32], I[32:]
-        il_int = int.from_bytes(Il, 'big')
-        if il_int >= SECP256k1.order:
-            return None
-        child_int = (il_int + int.from_bytes(current_priv, 'big')) % SECP256k1.order
-        if child_int == 0:
-            return None
-        current_priv = child_int.to_bytes(32, 'big')
-        current_chaincode = Ir
-    return current_priv
+		cookie_text = raw_cookie[:content_length].decode("ascii")
+		try:
+			rpc_user, rpc_pass = cookie_text.split(":", 1)
+		except ValueError:
+			raise ToolError("The RPC cookie file has invalid contents") from None
+		if not rpc_user or not rpc_pass:
+			raise ToolError("The RPC cookie file has invalid contents") from None
+		return rpc_user, rpc_pass
+	finally:
+		cookie_text = ""
+		rpc_user = ""
+		rpc_pass = ""
+		if cookie_file is not None:
+			try:
+				cookie_file.close()
+			except OSError:
+				pass
+		elif file_descriptor is not None:
+			try:
+				os.close(file_descriptor)
+			except OSError:
+				pass
+		for index in range(len(raw_cookie)):
+			raw_cookie[index] = 0
+		raw_cookie.clear()
 
-# ---------------- RPC helper ----------------
-def rpc_call(method, params=None):
-    if params is None:
-        params = []
-    payload = {"jsonrpc": "1.0", "id": "script", "method": method, "params": params}
-    r = session.post(url, json=payload)
-    r.raise_for_status()
-    return r.json()
+def clear_prepared_request_data(prepared_request: Any) -> None:
+	if prepared_request is None:
+		return
+	try:
+		prepared_request.body = None
+	except Exception:
+		pass
+	try:
+		headers = prepared_request.headers
+	except Exception:
+		headers = None
+	if headers is not None:
+		try:
+			headers.pop("Authorization", None)
+		except Exception:
+			pass
 
-# ---------------- Build private descriptor from public and WIF ----------------
-def build_priv_desc(public_desc, wif):
-    if not public_desc:
-        return None
-    base = public_desc.split('#')[0]
-    # Determine the type and replace the key part with WIF
-    if base.startswith('pkh(') and base.endswith(')'):
-        new_base = 'pkh(' + wif + ')'
-    elif base.startswith('wpkh(') and base.endswith(')'):
-        new_base = 'wpkh(' + wif + ')'
-    elif base.startswith('sh(wpkh(') and base.endswith('))'):
-        new_base = 'sh(wpkh(' + wif + '))'
-    # More types possible if needed, e.g., 'wsh(', etc.
-    else:
-        return None
-    # Get checksum
-    try:
-        res = rpc_call("getdescriptorinfo", [new_base])
-        if 'result' in res and 'checksum' in res['result']:
-            checksum = res['result']['checksum']
-            return new_base + '#' + checksum
-        else:
-            return None
-    except Exception as e:
-        return None
+def clear_rpc_response_data(response: Any) -> bool:
+	if response is None:
+		return False
+	try:
+		prepared_request = getattr(response, "request", None)
+	except Exception:
+		prepared_request = None
+	clear_prepared_request_data(prepared_request)
+	try:
+		response.request = None
+	except Exception:
+		pass
+	try:
+		response.headers.pop("Authorization", None)
+	except Exception:
+		pass
+	try:
+		response._content = b""
+	except Exception:
+		pass
+	close_failed = False
+	try:
+		response.close()
+	except Exception:
+		close_failed = True
+	try:
+		response.raw = None
+	except Exception:
+		pass
+	return close_failed
 
-# ---------------- gather relevant addresses ----------------
-print("Loading names (name_list) and filtering ismine==true ...")
-names = []
-try:
-    res = rpc_call("name_list", [])
-    all_names = res.get("result", []) or []
-    names = [n for n in all_names if n.get("ismine") is True]
-    print(f"→ {len(names):,} ismine names found")
-except Exception as e:
-    print("Error with name_list:", e)
+def clear_exception_private_data(exception: BaseException) -> None:
+	pending: list[BaseException] = [exception]
+	seen: set[int] = set()
+	while pending:
+		current = pending.pop()
+		identity = id(current)
+		if identity in seen:
+			continue
+		seen.add(identity)
+		try:
+			context = current.__context__
+		except Exception:
+			context = None
+		try:
+			cause = current.__cause__
+		except Exception:
+			cause = None
+		if isinstance(context, BaseException):
+			pending.append(context)
+		if isinstance(cause, BaseException):
+			pending.append(cause)
+		try:
+			prepared_request = getattr(current, "request", None)
+		except Exception:
+			prepared_request = None
+		clear_prepared_request_data(prepared_request)
+		try:
+			response = getattr(current, "response", None)
+		except Exception:
+			response = None
+		clear_rpc_response_data(response)
+		try:
+			current.request = None
+		except Exception:
+			pass
+		try:
+			current.response = None
+		except Exception:
+			pass
+		for attribute, replacement in (
+			("doc", ""),
+			("msg", ""),
+			("pos", 0),
+			("lineno", 0),
+			("colno", 0),
+		):
+			try:
+				if hasattr(current, attribute):
+					setattr(current, attribute, replacement)
+			except Exception:
+				pass
+		try:
+			current.args = ()
+		except Exception:
+			pass
+		try:
+			current.__traceback__ = None
+		except Exception:
+			pass
+		try:
+			current.__context__ = None
+		except Exception:
+			pass
+		try:
+			current.__cause__ = None
+		except Exception:
+			pass
 
-name_addresses = set()
-for n in names:
-    try:
-        nm = n.get("name")
-        r = rpc_call("name_show", [nm])
-        rr = r.get("result", {}) or {}
-        addr = rr.get("address")
-        if addr:
-            name_addresses.add(addr)
-    except Exception:
-        continue
+class RpcClient:
+	def __init__(self) -> None:
+		self._request_id = 0
+		self._auth: list[str] = []
+		self._session: requests.Session | None = None
+		rpc_user = ""
+		rpc_pass = ""
+		try:
+			rpc_user, rpc_pass = read_rpc_cookie(get_cookie_path())
+			self._auth.extend((rpc_user, rpc_pass))
+			self._session = requests.Session()
+			adapter = requests.adapters.HTTPAdapter(
+				pool_connections=1,
+				pool_maxsize=1,
+				max_retries=0,
+				pool_block=True,
+			)
+			self._session.mount("http://", adapter)
+			self._session.auth = (self._auth[0], self._auth[1])
+			self._session.headers.update(
+				{
+					"Accept": "application/json",
+					"Content-Type": "application/json",
+				}
+			)
+			self._session.trust_env = False
+		except ToolError:
+			self.close()
+			raise
+		except Exception as exc:
+			self.close()
+			raise RpcTransportError("Could not initialize the RPC HTTP session") from exc
+		finally:
+			rpc_user = ""
+			rpc_pass = ""
 
-utxo_addresses = set()
-try:
-    r = rpc_call("listunspent", [])
-    utxos = r.get("result", []) or []
-    for u in utxos:
-        addr = u.get("address")
-        if addr:
-            utxo_addresses.add(addr)
-    print(f"→ {len(utxo_addresses):,} UTXO addresses loaded")
-except Exception as e:
-    print("Error with listunspent:", e)
-    utxos = []
+	def close(self) -> None:
+		session = self._session
+		self._session = None
+		if session is not None:
+			try:
+				session.auth = None
+				session.headers.pop("Authorization", None)
+			except Exception:
+				pass
+		try:
+			if session is not None:
+				session.close()
+		except Exception:
+			print("[WARNING] Could not close the RPC HTTP session.", file=sys.stderr)
+		finally:
+			for index in range(len(self._auth)):
+				self._auth[index] = ""
+			self._auth.clear()
 
-addresses_to_check = name_addresses | utxo_addresses
-print(f"→ Total {len(addresses_to_check):,} relevant addresses (names+UTXOs)")
+	def call(self, method: str, *params: Any) -> Any:
+		if self._session is None:
+			params = ()
+			raise RpcTransportError("The RPC HTTP session is closed")
+		if not isinstance(method, str) or not method:
+			params = ()
+			raise RpcTransportError("An invalid RPC method was requested")
 
-# ---------------- listdescriptors true ----------------
-print("Calling listdescriptors true (searching for private xprvs/WIFs) ...")
-hd_dict = defaultdict(list)  # fp -> [{'xprv':..., 'origin_len':..., 'matching_path':...}, ...]
-pubkey_to_wif = {}
-unextracted_names = []
-unextracted_utxos = []
-hd_descriptors = []
+		self._request_id += 1
+		request_id = self._request_id
+		payload = {
+			"jsonrpc": "1.0",
+			"id": request_id,
+			"method": method,
+			"params": list(params),
+		}
+		response: Any = None
+		post_error_message: str | None = None
+		try:
+			response = self._session.post(
+				url,
+				json=payload,
+				timeout=(RPC_CONNECT_TIMEOUT, RPC_READ_TIMEOUT),
+				allow_redirects=False,
+			)
+		except requests.Timeout as exc:
+			clear_exception_private_data(exc)
+			post_error_message = f"RPC call {method} timed out"
+		except (requests.ConnectionError, requests.RequestException, TypeError, ValueError) as exc:
+			error_name = type(exc).__name__
+			clear_exception_private_data(exc)
+			post_error_message = f"RPC connection failed during {method} ({error_name})"
+		finally:
+			params = ()
+			payload["params"] = []
+			payload.clear()
+		if post_error_message is not None:
+			raise RpcTransportError(post_error_message) from None
 
-try:
-    ld = rpc_call("listdescriptors", [True])
-    descriptors_all = ld.get("result", {}).get("descriptors", []) or []
-except Exception as e:
-    print("Error with listdescriptors true:", e)
-    descriptors_all = []
+		status_code = response.status_code
+		envelope: Any = None
+		result: Any = None
+		error: Any = None
+		message = ""
+		detail = ""
+		response_id: Any = None
+		code: Any = None
+		response_cleanup_failed = False
+		try:
+			if status_code in {401, 403}:
+				raise RpcTransportError(
+					"RPC authentication failed; the cookie may be stale or belong to a different "
+					"Core instance or data directory. Make sure the intended Core instance is "
+					"running with the correct data directory, then restart this tool to reload the cookie"
+				)
+			if status_code not in {200, 400, 404, 500}:
+				raise RpcTransportError(
+					f"RPC call {method} returned HTTP status {status_code}"
+				)
+			try:
+				envelope = response.json()
+			except ValueError as exc:
+				clear_exception_private_data(exc)
+				invalid_json = True
+			else:
+				invalid_json = False
+			if invalid_json:
+				raise RpcTransportError(f"RPC call {method} returned invalid JSON") from None
+		finally:
+			response_cleanup_failed = clear_rpc_response_data(response)
+			response = None
 
-def parse_descriptor_entry(desc_str):
-    if not desc_str:
-        return
-    desc_n = desc_str.split('#')[0]
+		try:
+			if response_cleanup_failed:
+				raise RpcTransportError(f"RPC connection failed during {method}") from None
+			if not isinstance(envelope, dict):
+				raise RpcTransportError(f"RPC call {method} returned an invalid JSON-RPC envelope")
+			response_id = envelope.get("id")
+			if not isinstance(response_id, int) or isinstance(response_id, bool) or response_id != request_id:
+				raise RpcTransportError(f"RPC call {method} returned an invalid response ID")
+			if "result" not in envelope or "error" not in envelope:
+				raise RpcTransportError(f"RPC call {method} returned an invalid JSON-RPC result")
+			error = envelope["error"]
+			if error is not None:
+				if not isinstance(error, dict):
+					raise RpcTransportError(f"RPC call {method} returned an invalid JSON-RPC error")
+				code = error.get("code")
+				message = error.get("message")
+				if not isinstance(code, int) or isinstance(code, bool) or not isinstance(message, str):
+					raise RpcTransportError(f"RPC call {method} returned an invalid JSON-RPC error")
+				detail = redact_error(message)
+				raise ToolError(f"RPC call {method} failed with code {code}: {detail}")
+			if status_code != 200:
+				raise RpcTransportError(f"RPC call {method} returned HTTP status {status_code}")
+			result = envelope["result"]
+			return result
+		finally:
+			envelope = None
+			result = None
+			error = None
+			message = ""
+			detail = ""
+			response_id = None
+			code = None
 
-    # Handle nested descriptors
-    nested = False
-    if desc_n.startswith('sh(wpkh(') and desc_n.endswith('))'):
-        key_part = desc_n[8:-2]  # remove "sh(wpkh(" and "))"
-        nested = True
-    elif desc_n.startswith('wpkh(') and desc_n.endswith(')'):
-        key_part = desc_n[5:-1]
-    elif desc_n.startswith('pkh(') and desc_n.endswith(')'):
-        key_part = desc_n[4:-1]
-    # More nested types possible if needed, e.g., wsh(multi(...
-    else:
-        key_part = desc_n  # fallback
+def create_exclusive_file(directory: Path, prefix: str, suffix: str) -> tuple[int, Path]:
+	try:
+		directory.mkdir(parents=True, exist_ok=True)
+	except OSError as exc:
+		raise ToolError(f"Could not create data directory {directory}: {exc}") from exc
+	if not directory.is_dir():
+		raise ToolError(f"Data directory is not a directory: {directory}")
 
-    bracket_path_str = ''
-    fingerprint = None
-    ext_key = key_part
+	flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+	if hasattr(os, "O_BINARY"):
+		flags |= os.O_BINARY
+	for _attempt in range(EXCLUSIVE_CREATE_ATTEMPTS):
+		path = directory / f"{prefix}{secrets.token_hex(8)}{suffix}"
+		try:
+			file_descriptor = os.open(path, flags, 0o600)
+		except FileExistsError:
+			continue
+		except OSError as exc:
+			raise ToolError(f"Data directory is not writable: {directory}") from exc
+		return file_descriptor, path
+	raise ToolError(f"Could not create a unique temporary file in {directory}")
 
-    m = re.match(r'^\[([0-9a-fA-F]{8})(/[^]]*)?\](.+)$', key_part)
-    if m:
-        fingerprint = m.group(1).lower()
-        bracket_path_str = m.group(2) or ''
-        ext_key = m.group(3)
+def remove_private_temporary_file(path: Path) -> None:
+	try:
+		path.unlink()
+	except FileNotFoundError:
+		pass
+	except OSError:
+		print(f"[WARNING] Could not remove private temporary file: {path}", file=sys.stderr)
 
-    suffix_start = ext_key.find('/')
-    extkey_root = ext_key if suffix_start == -1 else ext_key[:suffix_start]
+def validate_output_directory(paths: tuple[Path, ...]) -> None:
+	parents = {path.parent.resolve() for path in paths}
+	if len(parents) != 1:
+		raise ToolError("All export files must use the same data directory")
+	directory = next(iter(parents))
+	for path in paths:
+		if path.is_symlink() or (path.exists() and not path.is_file()):
+			raise ToolError(f"Export target is not a regular file: {path}")
 
-    if extkey_root.startswith(('xprv', 'tprv', 'yprv', 'zprv', 'dprv')):
-        suffix = ext_key[suffix_start:] if suffix_start != -1 else ''
-        if suffix.endswith('/*'):
-            suffix = suffix[:-2]
-        origin = parse_path(bracket_path_str)
-        suffix_fixed = parse_path(suffix)
-        fp = fingerprint or compute_fingerprint_from_xprv(extkey_root)
-        if fp:
-            hd_dict[fp].append({
-                'xprv': extkey_root,
-                'origin_len': len(origin),
-                'matching_path': origin + suffix_fixed,
-                'nested': nested  # Add flag for nested
-            })
-            hd_descriptors.append(desc_str)
-        return
+	file_descriptor, probe_path = create_exclusive_file(
+		directory,
+		".wallet-maintenance-write-test-",
+		".tmp",
+	)
+	try:
+		os.close(file_descriptor)
+		file_descriptor = -1
+		probe_path.unlink()
+	except OSError as exc:
+		if file_descriptor >= 0:
+			try:
+				os.close(file_descriptor)
+			except OSError:
+				pass
+		remove_private_temporary_file(probe_path)
+		raise ToolError(f"Data directory failed its write/delete test: {directory}") from exc
 
-    try:
-        pub = compute_pubkey_from_wif(extkey_root)
-        if pub:
-            pubkey_to_wif[pub.lower()] = extkey_root
-            return
-    except Exception:
-        pass
+def validate_wallet(rpc: RpcClient) -> None:
+	wallets = rpc.call("listwallets")
+	if not isinstance(wallets, list) or len(wallets) != 1:
+		raise ToolError("Exactly one Namecoin Core wallet must be loaded")
 
-for d in descriptors_all:
-    ds = d.get("desc")
-    if ds:
-        parse_descriptor_entry(ds)
-    pd = d.get("parent_desc")
-    if pd:
-        parse_descriptor_entry(pd)
+	info = rpc.call("getwalletinfo")
+	if not isinstance(info, dict):
+		raise ToolError("getwalletinfo returned an invalid result")
+	if info.get("descriptors") is not True:
+		raise ToolError("The loaded wallet is not a descriptor wallet")
+	if info.get("private_keys_enabled") is not True:
+		raise ToolError("Private keys are disabled in the loaded wallet")
+	if info.get("scanning") is not False:
+		raise ToolError("The loaded wallet is currently scanning; wait until the scan is complete")
 
-print(f"→ {len(pubkey_to_wif):,} simple keys loaded from descriptors")
-print(f"→ {len(hd_dict):,} HD-xprv fingerprints loaded")
+def ensure_wallet_alive(rpc: RpcClient) -> None:
+	info = rpc.call("getwalletinfo")
+	if not isinstance(info, dict):
+		raise ToolError("Wallet liveness check returned an invalid getwalletinfo result")
 
-# Save HD private descriptors to file (deduplicated)
-with open("descriptors_hd.txt", "w", encoding="utf-8") as fh:
-    for x in set(hd_descriptors):
-        fh.write(x + "\n")
-print(f"→ {len(set(hd_descriptors))} HD private descriptors saved in descriptors_hd.txt (for master-key generated addresses)")
+def single_line_text(value: object) -> str:
+	return " ".join(str(value).split())
 
-# ---------------- process addresses ----------------
-errors = []
+def error_log_line(*parts: object) -> str:
+	identifiers = [single_line_text(part) for part in parts[:-1]]
+	message = redact_error(str(parts[-1]))
+	return " | ".join((*identifiers, message))
 
-def process_address(addr, error_list):
-    try:
-        r = rpc_call("getaddressinfo", [addr])
-        info = r.get("result", {}) or {}
-    except Exception:
-        error_list.append(f"Error fetching getaddressinfo for {addr}")
-        return None
+def load_private_descriptors(rpc: RpcClient) -> tuple[Any, list[dict[str, Any]]]:
+	try:
+		private_data = rpc.call("listdescriptors", True)
+	except RpcTransportError:
+		raise
+	except ToolError as exc:
+		raise ToolError(
+			f"Could not read private descriptors. Unlock an encrypted wallet first. {exc}"
+		) from exc
 
-    pubkey = info.get("pubkey", "").lower()
-    embedded = info.get("embedded", {})
-    if not pubkey and embedded:
-        pubkey = embedded.get("pubkey", "").lower()
+	descriptors = private_data.get("descriptors") if isinstance(private_data, dict) else None
+	if not isinstance(descriptors, list) or not all(isinstance(entry, dict) for entry in descriptors):
+		clear_private_descriptor_data(private_data)
+		raise ToolError("listdescriptors true returned no valid descriptor list")
+	return private_data, descriptors
 
-    fingerprint = info.get("hdmasterfingerprint") or embedded.get("hdmasterfingerprint")
-    hdkeypath = info.get("hdkeypath") or embedded.get("hdkeypath")
+def valid_block_height(value: Any) -> bool:
+	return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
-    public_desc = info.get("desc") or embedded.get("desc")
+def valid_block_hash(value: Any) -> bool:
+	return (
+		isinstance(value, str)
+		and len(value) == 64
+		and all(character in "0123456789abcdefABCDEF" for character in value)
+	)
 
-    if not pubkey and not fingerprint:
-        error_list.append(f"Skipping legacy address without pubkey or HD info: {addr}")
-        return None
+def older_height(current: int | None, candidate: int) -> int:
+	return candidate if current is None else min(current, candidate)
 
-    if pubkey and pubkey in pubkey_to_wif:
-        wif = pubkey_to_wif[pubkey]
-        return build_priv_desc(public_desc, wif)
+def active_chain_tip(rpc: RpcClient, expected_chain: str) -> int:
+	blockchain_info = rpc.call("getblockchaininfo")
+	if not isinstance(blockchain_info, dict) or blockchain_info.get("chain") != expected_chain:
+		raise ToolError("getblockchaininfo returned an invalid or changed active chain")
+	tip_height = blockchain_info.get("blocks")
+	if not valid_block_height(tip_height):
+		raise ToolError("getblockchaininfo returned no usable block height")
+	return tip_height
 
-    if pubkey and fingerprint and fingerprint in hd_dict and hdkeypath:
-        full_path = parse_path(hdkeypath)
-        for hd_info in hd_dict[fingerprint]:
-            matching_path = hd_info['matching_path']
-            if len(full_path) >= len(matching_path) and full_path[:len(matching_path)] == matching_path:
-                relative = full_path[len(matching_path):]
-                derive_path = hd_info['matching_path'][hd_info['origin_len']:] + relative
-                priv = derive_priv(hd_info['xprv'], derive_path)
-                if priv:
-                    # Try compressed first
-                    pubcalc = compute_pubkey_from_priv(priv, compressed=True)
-                    if pubcalc.lower() == pubkey:
-                        wif = priv_to_wif(priv, compressed=True)
-                        return build_priv_desc(public_desc, wif)
-                    # Try uncompressed
-                    pubcalc_uncomp = compute_pubkey_from_priv(priv, compressed=False)
-                    if pubcalc_uncomp.lower() == pubkey:
-                        wif = priv_to_wif(priv, compressed=False)
-                        return build_priv_desc(public_desc, wif)
-        # Additional try: relative from origin_len
-        for hd_info in hd_dict[fingerprint]:
-            relative = full_path[hd_info['origin_len']:]
-            priv = derive_priv(hd_info['xprv'], relative)
-            if priv:
-                pubcalc = compute_pubkey_from_priv(priv, compressed=True)
-                if pubcalc.lower() == pubkey:
-                    wif = priv_to_wif(priv, compressed=True)
-                    return build_priv_desc(public_desc, wif)
-                pubcalc_uncomp = compute_pubkey_from_priv(priv, compressed=False)
-                if pubcalc_uncomp.lower() == pubkey:
-                    wif = priv_to_wif(priv, compressed=False)
-                    return build_priv_desc(public_desc, wif)
-        # Fallback if origin_len == 0 or additional
-        for hd_info in hd_dict[fingerprint]:
-            if hd_info['origin_len'] == 0:
-                priv = derive_priv(hd_info['xprv'], full_path)
-                if priv:
-                    # Try compressed
-                    pubcalc = compute_pubkey_from_priv(priv, compressed=True)
-                    if pubcalc.lower() == pubkey:
-                        wif = priv_to_wif(priv, compressed=True)
-                        return build_priv_desc(public_desc, wif)
-                    # Try uncompressed
-                    pubcalc_uncomp = compute_pubkey_from_priv(priv, compressed=False)
-                    if pubcalc_uncomp.lower() == pubkey:
-                        wif = priv_to_wif(priv, compressed=False)
-                        return build_priv_desc(public_desc, wif)
-    else:
-        error_list.append(f"No HD info or pubkey for {addr}: pubkey len={len(pubkey) if pubkey else 'None'}, fingerprint={fingerprint}, path={hdkeypath}")
+def collect_name_targets(
+	rpc: RpcClient,
+) -> tuple[list[tuple[str, str]], int | None, list[str]]:
+	encoding_options = {"nameEncoding": "hex", "valueEncoding": "hex"}
+	records = rpc.call("name_list", "", encoding_options)
+	if not isinstance(records, list):
+		raise ToolError("name_list returned an invalid result")
 
-    return None
+	candidates = [entry for entry in records if isinstance(entry, dict) and entry.get("ismine") is True]
+	targets: list[tuple[str, str]] = []
+	oldest_height: int | None = None
+	errors: list[str] = []
+	for entry in candidates:
+		name = entry.get("name")
+		if not isinstance(name, str) or not name:
+			errors.append(error_log_line("Invalid name_list entry without a name"))
+			continue
+		try:
+			current = rpc.call("name_show", name, encoding_options)
+		except RpcTransportError:
+			raise
+		except ToolError as exc:
+			ensure_wallet_alive(rpc)
+			errors.append(error_log_line(name, exc))
+			continue
+		if not isinstance(current, dict):
+			errors.append(error_log_line(name, "name_show returned an invalid result"))
+			continue
+		if current.get("ismine") is not True:
+			continue
+		current_height = current.get("height")
+		if valid_block_height(current_height):
+			oldest_height = older_height(oldest_height, current_height)
+		else:
+			raise ToolError(f"name_show returned no usable block height for owned name {name}")
+		address = current.get("address")
+		if not isinstance(address, str) or not address:
+			errors.append(error_log_line(name, "name_show returned no address"))
+			continue
+		targets.append((name, address))
+	return targets, oldest_height, errors
 
-# ---- Names ----
-print("Processing names (only ismine=true)...")
-found_names = 0
-with open("descriptors_names.txt", "w", encoding="utf-8") as out_names:
-    for idx, n in enumerate(names, 1):
-        nm = n.get("name")
-        try:
-            r = rpc_call("name_show", [nm])
-            res = r.get("result", {}) or {}
-            addr = res.get("address")
-            if not addr:
-                continue
-            priv_desc = process_address(addr, errors)
-            if priv_desc:
-                out_names.write(priv_desc + "\n")
-                found_names += 1
-            else:
-                unextracted_names.append(f"{nm} | no priv key extracted | addr={addr}")
-        except Exception:
-            unextracted_names.append(f"{nm} | error_fetching")
-        if idx % 1000 == 0 or idx == len(names):
-            print(f"→ {idx}/{len(names)} names processed...")
-print(f"→ {found_names} name private descriptors extracted")
+def collect_utxo_addresses(
+	rpc: RpcClient,
+) -> tuple[list[str], int | None, int, list[str]]:
+	utxos = rpc.call("listunspent", 0)
+	if not isinstance(utxos, list):
+		raise ToolError("listunspent returned an invalid result")
 
-if unextracted_names:
-    print(f"→ {len(unextracted_names)} names could not be extracted (check logs)")
-    with open("unextracted_names.txt", "w", encoding="utf-8") as fh:
-        for x in unextracted_names:
-            fh.write(x + "\n")
+	addresses: set[str] = set()
+	txids: set[str] = set()
+	errors: list[str] = []
+	for entry in utxos:
+		if not isinstance(entry, dict):
+			raise ToolError("listunspent returned an invalid UTXO entry")
+		if entry.get("spendable") is not True or entry.get("solvable") is not True:
+			continue
+		txid = entry.get("txid")
+		if not valid_block_hash(txid):
+			raise ToolError("listunspent returned a current UTXO without a valid transaction ID")
+		vout = entry.get("vout")
+		if not isinstance(vout, int) or isinstance(vout, bool) or vout < 0:
+			raise ToolError("listunspent returned a current UTXO without a valid output index")
+		txids.add(txid.lower())
+		address = entry.get("address")
+		if isinstance(address, str) and address:
+			addresses.add(address)
+			continue
+		errors.append(
+			error_log_line(
+				f"{txid}:{vout}",
+				"listunspent returned no address for a spendable and solvable UTXO",
+			)
+		)
 
-# ---- UTXOs ----
-print("Processing UTXOs (current listunspent addresses)...")
-found_utxos = 0
-with open("descriptors_utxos.txt", "w", encoding="utf-8") as out_utxos:
-    for idx, u in enumerate(utxos, 1):
-        addr = u.get("address")
-        if not addr:
-            continue
-        priv_desc = process_address(addr, errors)
-        if priv_desc:
-            out_utxos.write(priv_desc + "\n")
-            found_utxos += 1
-        else:
-            unextracted_utxos.append(f"{addr} | no priv key extracted")
-        if idx % 500 == 0 or idx == len(utxos):
-            print(f"→ {idx}/{len(utxos)} UTXOs processed...")
-print(f"→ {found_utxos} UTXO private descriptors extracted")
+	oldest_height: int | None = None
+	unconfirmed = 0
+	for txid in sorted(txids):
+		transaction = rpc.call("gettransaction", txid)
+		if not isinstance(transaction, dict):
+			raise ToolError(f"gettransaction returned an invalid result for {txid}")
+		returned_txid = transaction.get("txid")
+		if not valid_block_hash(returned_txid) or returned_txid.lower() != txid:
+			raise ToolError(f"gettransaction returned the wrong transaction for {txid}")
+		confirmations = transaction.get("confirmations")
+		if not isinstance(confirmations, int) or isinstance(confirmations, bool) or confirmations < 0:
+			raise ToolError(f"gettransaction returned invalid confirmations for {txid}")
+		if confirmations == 0:
+			if "blockheight" in transaction:
+				raise ToolError(f"gettransaction returned inconsistent block data for {txid}")
+			unconfirmed += 1
+			continue
+		block_height = transaction.get("blockheight")
+		if not valid_block_height(block_height):
+			raise ToolError(f"gettransaction returned no usable block height for {txid}")
+		oldest_height = older_height(oldest_height, block_height)
+	return sorted(addresses), oldest_height, unconfirmed, errors
 
-if unextracted_utxos:
-    print(f"→ {len(unextracted_utxos)} UTXOs could not be extracted (check logs)")
-    with open("unextracted_utxos.txt", "w", encoding="utf-8") as fh:
-        for x in unextracted_utxos:
-            fh.write(x + "\n")
+def build_rescan_metadata(
+	rpc: RpcClient,
+	chain: str,
+	inventory_tip: int,
+	oldest_name_height: int | None,
+	oldest_utxo_height: int | None,
+) -> dict[str, Any]:
+	if not valid_block_height(inventory_tip):
+		raise ToolError("The inventory chain-tip snapshot is invalid")
+	export_tip = active_chain_tip(rpc, chain)
 
-# ---- Cleanup ----
-for fp in list(hd_dict.keys()):
-    for entry in hd_dict[fp]:
-        entry['xprv'] = None
-hd_dict.clear()
-print("Temporary xprv strings deleted (best-effort).")
+	confirmed_heights = [
+		height for height in (oldest_name_height, oldest_utxo_height) if height is not None
+	]
+	if any(height > export_tip for height in confirmed_heights):
+		raise ToolError("A current wallet output has a block height above the active chain tip")
+	base_height = min(inventory_tip, export_tip, *confirmed_heights)
+	start_height = max(0, base_height - RECENT_BLOCK_RESCAN_MARGIN)
 
-# ---- Error log ----
-if errors:
-    print("\nError log:")
-    for err in errors:
-        print(err)
+	start_blockhash = rpc.call("getblockhash", start_height)
+	if not valid_block_hash(start_blockhash):
+		raise ToolError("getblockhash returned an invalid result while preparing rescan metadata")
+	return {
+		"format": RESCAN_METADATA_FORMAT,
+		"chain": chain,
+		"start_height": start_height,
+		"start_blockhash": start_blockhash.lower(),
+	}
 
-print("Done!")
+def valid_timestamp(value: Any) -> bool:
+	return value == "now" or (
+		isinstance(value, int)
+		and not isinstance(value, bool)
+		and value >= 0
+	)
 
+def normalize_range(value: Any) -> list[int] | None:
+	if not isinstance(value, list) or len(value) != 2:
+		return None
+	if any(not isinstance(item, int) or isinstance(item, bool) for item in value):
+		return None
+	start, end = value
+	return [start, end] if 0 <= start <= end else None
+
+def build_hd_import_requests(
+	rpc: RpcClient,
+	descriptors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+	requests: list[dict[str, Any]] = []
+	seen: set[bytes] = set()
+	for entry in descriptors:
+		descriptor = entry.get("desc")
+		range_value = normalize_range(entry.get("range"))
+		if not isinstance(descriptor, str) or range_value is None:
+			continue
+
+		info = rpc.call("getdescriptorinfo", descriptor)
+		if not isinstance(info, dict) or info.get("isrange") is not True:
+			raise ToolError("A ranged wallet descriptor failed descriptor validation")
+		if info.get("hasprivatekeys") is not True:
+			raise ToolError("A ranged wallet descriptor does not contain private keys")
+
+		digest = hashlib.sha256(descriptor.encode("utf-8")).digest()
+		if digest in seen:
+			raise ToolError("listdescriptors returned a duplicate ranged descriptor")
+		seen.add(digest)
+
+		timestamp = entry.get("timestamp")
+		if not valid_timestamp(timestamp):
+			raise ToolError("A ranged wallet descriptor has an invalid timestamp")
+		request: dict[str, Any] = {
+			"desc": descriptor,
+			"timestamp": timestamp,
+			"range": range_value,
+		}
+
+		active = entry.get("active")
+		internal = entry.get("internal")
+		if not isinstance(active, bool):
+			raise ToolError("A ranged wallet descriptor has no valid active state")
+		if active and not isinstance(internal, bool):
+			raise ToolError("An active ranged wallet descriptor has no valid internal state")
+		request["active"] = active
+		if isinstance(internal, bool):
+			request["internal"] = internal
+
+		next_index = entry.get("next_index", entry.get("next"))
+		if not isinstance(next_index, int) or isinstance(next_index, bool) or next_index < 0:
+			raise ToolError("A ranged wallet descriptor has an invalid next index")
+		if not range_value[0] <= next_index <= range_value[1]:
+			raise ToolError("A ranged wallet descriptor next index is outside its range")
+		request["next_index"] = next_index
+		requests.append(request)
+	return requests
+
+def build_descriptor_search_index(
+	rpc: RpcClient,
+	descriptors: list[dict[str, Any]],
+	wif_prefix: int,
+) -> tuple[
+	list[dict[str, Any]],
+	dict[str, list[dict[str, Any]]],
+	dict[str, list[dict[str, Any]]],
+]:
+	ranged_descriptors: list[dict[str, Any]] = []
+	ranged_by_parent: dict[str, list[dict[str, Any]]] = {}
+	imported_by_pubkey: dict[str, list[dict[str, Any]]] = {}
+	public_by_private_id: dict[int, str] = {}
+	public_data = rpc.call("listdescriptors", False)
+	try:
+		public_descriptors = public_data.get("descriptors") if isinstance(public_data, dict) else None
+		if isinstance(public_descriptors, list) and len(public_descriptors) == len(descriptors):
+			for private_entry, public_entry in zip(descriptors, public_descriptors):
+				public_descriptor = public_entry.get("desc") if isinstance(public_entry, dict) else None
+				private_descriptor = parse_single_key_descriptor(private_entry.get("desc"))
+				public_parsed = parse_single_key_descriptor(public_descriptor)
+				if (
+					isinstance(public_descriptor, str)
+					and descriptor_range(private_entry) == descriptor_range(public_entry)
+					and private_entry.get("active") == public_entry.get("active")
+					and private_entry.get("internal") == public_entry.get("internal")
+					and private_entry.get("next_index", private_entry.get("next"))
+					== public_entry.get("next_index", public_entry.get("next"))
+					and private_descriptor is not None
+					and public_parsed is not None
+					and private_descriptor.kind == public_parsed.kind
+				):
+					public_by_private_id[id(private_entry)] = public_descriptor
+	finally:
+		clear_private_descriptor_data(public_data)
+
+	for entry in descriptors:
+		parsed = parse_single_key_descriptor(entry.get("desc"))
+		if descriptor_range(entry) is not None or (
+			parsed is not None and parse_extended_private_key(parsed.key_expression) is not None
+		):
+			ranged_descriptors.append(entry)
+			parent = public_by_private_id.get(id(entry))
+			if isinstance(parent, str):
+				ranged_by_parent.setdefault(parent, []).append(entry)
+			continue
+		if parsed is None:
+			continue
+		try:
+			without_origin, _origin = strip_key_origin(parsed.key_expression)
+			if "/" in without_origin:
+				continue
+			private_key, compressed_wif, _prefix = decode_wif(without_origin, wif_prefix)
+		except ValueError:
+			continue
+		compressed, uncompressed = public_keys_from_private(private_key)
+		pubkeys = [compressed if compressed_wif else uncompressed]
+		if compressed_wif:
+			pubkeys.append(compressed[2:])
+		for pubkey in pubkeys:
+			imported_by_pubkey.setdefault(pubkey, []).append(entry)
+	return ranged_descriptors, ranged_by_parent, imported_by_pubkey
+
+def imported_candidates(
+	address_info: dict[str, Any],
+	imported_by_pubkey: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+	candidates: list[dict[str, Any]] = []
+	seen: set[int] = set()
+	for pubkey in collect_target_pubkeys(address_info):
+		for entry in imported_by_pubkey.get(pubkey, []):
+			identity = id(entry)
+			if identity not in seen:
+				seen.add(identity)
+				candidates.append(entry)
+	return candidates
+
+def descriptor_inventory_counts(
+	ranged_descriptors: list[dict[str, Any]],
+	imported_by_pubkey: dict[str, list[dict[str, Any]]],
+) -> tuple[int, int | None]:
+	simple_key_count = sum(
+		1 for pubkey in imported_by_pubkey if len(pubkey) in {66, 130}
+	)
+	fingerprints: set[str] = set()
+	for entry in ranged_descriptors:
+		parsed = parse_single_key_descriptor(entry.get("desc"))
+		if parsed is None:
+			continue
+		extended = parse_extended_private_key(parsed.key_expression)
+		if extended is None:
+			continue
+		_without_origin, origin = strip_key_origin(parsed.key_expression)
+		if origin is not None:
+			fingerprints.add(origin.split("/", 1)[0].lower())
+			continue
+		compressed, _uncompressed = public_keys_from_private(extended.private_key)
+		try:
+			digest = hashlib.new(
+				"ripemd160",
+				hashlib.sha256(bytes.fromhex(compressed)).digest(),
+			).digest()
+		except ValueError:
+			return simple_key_count, None
+		fingerprints.add(digest[:4].hex())
+	return simple_key_count, len(fingerprints)
+
+def extract_address_request(
+	rpc: RpcClient,
+	ranged_descriptors: list[dict[str, Any]],
+	ranged_by_parent: dict[str, list[dict[str, Any]]],
+	imported_by_pubkey: dict[str, list[dict[str, Any]]],
+	address: str,
+	wif_prefix: int,
+) -> dict[str, Any]:
+	address_info = rpc.call("getaddressinfo", address)
+	if not isinstance(address_info, dict):
+		raise ToolError("getaddressinfo returned an invalid result")
+	if address_info.get("ismine") is not True:
+		raise ToolError("The target address is not owned by the loaded wallet")
+	if address_info.get("solvable") is not True:
+		raise ToolError("The loaded wallet cannot solve the target address")
+
+	canonical_address = address_info.get("address")
+	if isinstance(canonical_address, str):
+		address = canonical_address
+
+	result: ExtractionResult | None = None
+	try:
+		embedded = address_info.get("embedded")
+		parent = address_info.get("parent_desc")
+		if not isinstance(parent, str) and isinstance(embedded, dict):
+			parent = embedded.get("parent_desc")
+		hd_candidates = (
+			ranged_by_parent.get(parent, ranged_descriptors)
+			if isinstance(parent, str)
+			else ranged_descriptors
+		)
+		result = find_hd_result(rpc, hd_candidates, address_info, address, wif_prefix)
+		if result is None and hd_candidates is not ranged_descriptors:
+			result = find_hd_result(rpc, ranged_descriptors, address_info, address, wif_prefix)
+		if result is None:
+			candidates = imported_candidates(address_info, imported_by_pubkey)
+			result = find_imported_result(rpc, candidates, address_info, address, wif_prefix)
+		if result is None:
+			raise ToolError("No matching private single-key descriptor was found")
+
+		timestamp = address_info.get("timestamp", 0)
+		if not valid_timestamp(timestamp):
+			raise ToolError("The target address has an invalid timestamp")
+		request: dict[str, Any] = {
+			"desc": result.private_descriptor,
+			"timestamp": timestamp,
+		}
+
+		internal = address_info.get("ischange")
+		labels = address_info.get("labels")
+		label = None
+		if isinstance(labels, list):
+			label = next((item for item in labels if isinstance(item, str) and item), None)
+		if internal is True:
+			request["internal"] = True
+		elif label is not None:
+			request["label"] = label
+		elif internal is False:
+			request["internal"] = False
+		return request
+	finally:
+		if result is not None:
+			result.wif = ""
+			result.private_descriptor = ""
+
+def build_name_import_requests(
+	rpc: RpcClient,
+	ranged_descriptors: list[dict[str, Any]],
+	ranged_by_parent: dict[str, list[dict[str, Any]]],
+	imported_by_pubkey: dict[str, list[dict[str, Any]]],
+	targets: list[tuple[str, str]],
+	wif_prefix: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+	requests: list[dict[str, Any]] = []
+	seen: set[bytes] = set()
+	errors: list[str] = []
+	for index, (name, address) in enumerate(targets, 1):
+		try:
+			request = extract_address_request(
+				rpc,
+				ranged_descriptors,
+				ranged_by_parent,
+				imported_by_pubkey,
+				address,
+				wif_prefix,
+			)
+		except RpcTransportError:
+			raise
+		except (ToolError, ValueError) as exc:
+			ensure_wallet_alive(rpc)
+			errors.append(error_log_line(name, address, exc))
+		else:
+			descriptor = request["desc"]
+			digest = hashlib.sha256(descriptor.encode("utf-8")).digest()
+			if digest not in seen:
+				seen.add(digest)
+				requests.append(request)
+			else:
+				clear_private_descriptor_data(request)
+
+		if index % 1000 == 0 or index == len(targets):
+			print(f"→ {index}/{len(targets)} names processed...")
+	return requests, errors
+
+def build_utxo_import_requests(
+	rpc: RpcClient,
+	ranged_descriptors: list[dict[str, Any]],
+	ranged_by_parent: dict[str, list[dict[str, Any]]],
+	imported_by_pubkey: dict[str, list[dict[str, Any]]],
+	addresses: list[str],
+	wif_prefix: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+	requests: list[dict[str, Any]] = []
+	seen: set[bytes] = set()
+	errors: list[str] = []
+	for index, address in enumerate(addresses, 1):
+		try:
+			request = extract_address_request(
+				rpc,
+				ranged_descriptors,
+				ranged_by_parent,
+				imported_by_pubkey,
+				address,
+				wif_prefix,
+			)
+		except RpcTransportError:
+			raise
+		except (ToolError, ValueError) as exc:
+			ensure_wallet_alive(rpc)
+			errors.append(error_log_line(address, exc))
+		else:
+			descriptor = request["desc"]
+			digest = hashlib.sha256(descriptor.encode("utf-8")).digest()
+			if digest not in seen:
+				seen.add(digest)
+				requests.append(request)
+			else:
+				clear_private_descriptor_data(request)
+
+		if index % 500 == 0 or index == len(addresses):
+			print(f"→ {index}/{len(addresses)} UTXOs processed...")
+	return requests, errors
+
+def stage_lines(path: Path, lines: Iterable[str], line_ending: str = "\n") -> Path:
+	iterator = iter(lines)
+	try:
+		first_line = next(iterator)
+	except StopIteration as exc:
+		raise ToolError(f"Refusing to create an empty export file: {path}") from exc
+
+	file_descriptor, temporary_path = create_exclusive_file(
+		path.parent,
+		f".{path.name}.",
+		".tmp",
+	)
+	try:
+		with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as handle:
+			file_descriptor = -1
+			handle.write(first_line + line_ending)
+			for line in iterator:
+				handle.write(line + line_ending)
+			handle.flush()
+			os.fsync(handle.fileno())
+		return temporary_path
+	except BaseException:
+		if file_descriptor >= 0:
+			try:
+				os.close(file_descriptor)
+			except OSError:
+				pass
+		remove_private_temporary_file(temporary_path)
+		raise
+
+def stage_json_lines(path: Path, records: list[dict[str, Any]]) -> Path:
+	lines = (
+		json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+		for record in records
+	)
+	return stage_lines(path, lines)
+
+def stage_descriptor_lines(path: Path, records: list[dict[str, Any]]) -> Path:
+	def descriptor_lines() -> Iterable[str]:
+		for record in records:
+			descriptor = record.get("desc")
+			if not isinstance(descriptor, str) or not descriptor:
+				raise ToolError(f"Refusing to write an invalid descriptor record: {path}")
+			yield descriptor
+
+	return stage_lines(path, descriptor_lines(), "\r\n")
+
+def stage_text_lines(path: Path, lines: list[str]) -> Path:
+	return stage_lines(path, (single_line_text(line) for line in lines))
+
+def reserve_backup_path(path: Path) -> Path:
+	file_descriptor, backup_path = create_exclusive_file(
+		path.parent,
+		f".{path.name}.",
+		".bak",
+	)
+	os.close(file_descriptor)
+	return backup_path
+
+def commit_staged_files(
+	staged: list[tuple[Path, Path]],
+	removed: tuple[Path, ...] = (),
+) -> None:
+	staged_targets = [final_path for _temporary_path, final_path in staged]
+	targets = staged_targets + list(removed)
+	if len(set(targets)) != len(targets):
+		raise ToolError("Each export target may only be changed once per commit")
+
+	backups: list[tuple[Path, Path | None]] = []
+	committed: set[Path] = set()
+	try:
+		for final_path in targets:
+			if final_path.exists():
+				backup_path = reserve_backup_path(final_path)
+				try:
+					os.replace(final_path, backup_path)
+				except BaseException:
+					try:
+						backup_path.unlink(missing_ok=True)
+					except OSError:
+						pass
+					raise
+				backups.append((final_path, backup_path))
+			else:
+				backups.append((final_path, None))
+
+		for temporary_path, final_path in staged:
+			os.replace(temporary_path, final_path)
+			committed.add(final_path)
+			try:
+				os.chmod(final_path, 0o600)
+			except OSError:
+				pass
+	except BaseException as exc:
+		rollback_failed = False
+		for final_path, backup_path in reversed(backups):
+			try:
+				if backup_path is not None:
+					os.replace(backup_path, final_path)
+				elif final_path in committed:
+					final_path.unlink(missing_ok=True)
+			except OSError:
+				rollback_failed = True
+		if rollback_failed:
+			raise ToolError(
+				"The export-file commit failed and rollback was incomplete; preserve any .bak files"
+			) from exc
+		raise
+	else:
+		for _final_path, backup_path in backups:
+			if backup_path is not None:
+				try:
+					backup_path.unlink(missing_ok=True)
+				except OSError:
+					print(
+						f"[WARNING] Could not remove private rollback backup: {backup_path}",
+						file=sys.stderr,
+					)
+
+def export_wallet_data(rpc: RpcClient, output_files: tuple[Path, ...]) -> None:
+	chain, wif_prefix = network_wif_prefix(rpc)
+	validate_wallet(rpc)
+	inventory_tip = active_chain_tip(rpc, chain)
+
+	print("Loading names (name_list) and filtering ismine==true ...")
+	name_targets, oldest_name_height, name_inventory_errors = collect_name_targets(rpc)
+	print(f"→ {len(name_targets):,} ismine names found")
+	utxo_addresses, oldest_utxo_height, unconfirmed_utxo_count, utxo_inventory_errors = (
+		collect_utxo_addresses(rpc)
+	)
+	print(f"→ {len(utxo_addresses):,} UTXO addresses loaded")
+	if unconfirmed_utxo_count:
+		print(
+			f"→ {unconfirmed_utxo_count:,} unconfirmed UTXO transactions will be covered "
+			"by the final rescan"
+		)
+	relevant_addresses = {address for _name, address in name_targets}
+	relevant_addresses.update(utxo_addresses)
+	print(f"→ Total {len(relevant_addresses):,} relevant addresses (names+UTXOs)")
+	relevant_addresses.clear()
+
+	private_data: Any = None
+	hd_requests: list[dict[str, Any]] = []
+	name_requests: list[dict[str, Any]] = []
+	utxo_requests: list[dict[str, Any]] = []
+	ranged_descriptors: list[dict[str, Any]] = []
+	ranged_by_parent: dict[str, list[dict[str, Any]]] = {}
+	imported_by_pubkey: dict[str, list[dict[str, Any]]] = {}
+	name_errors = list(name_inventory_errors)
+	utxo_errors = list(utxo_inventory_errors)
+	staged: list[tuple[Path, Path]] = []
+	try:
+		print("Calling listdescriptors true (searching for private xprvs/WIFs) ...")
+		private_data, descriptors = load_private_descriptors(rpc)
+
+		hd_requests = build_hd_import_requests(rpc, descriptors)
+		ranged_descriptors, ranged_by_parent, imported_by_pubkey = build_descriptor_search_index(
+			rpc,
+			descriptors,
+			wif_prefix,
+		)
+		simple_key_count, hd_fingerprint_count = descriptor_inventory_counts(
+			ranged_descriptors,
+			imported_by_pubkey,
+		)
+		print(f"→ {simple_key_count:,} simple keys loaded from descriptors")
+		if hd_fingerprint_count is None:
+			print("→ HD-xprv fingerprint count unavailable (RIPEMD-160 is not supported)")
+		else:
+			print(f"→ {hd_fingerprint_count:,} HD-xprv fingerprints loaded")
+		print(
+			f"→ {len(hd_requests):,} HD private descriptors prepared for "
+			"descriptors_hd.txt (for master-key generated addresses)"
+		)
+		print("Processing names (only ismine=true)...")
+		name_requests, extraction_errors = build_name_import_requests(
+			rpc,
+			ranged_descriptors,
+			ranged_by_parent,
+			imported_by_pubkey,
+			name_targets,
+			wif_prefix,
+		)
+		name_errors.extend(extraction_errors)
+		print(f"→ {len(name_requests)} name private descriptors extracted")
+		print("Processing UTXOs (current listunspent addresses)...")
+		utxo_requests, extraction_errors = build_utxo_import_requests(
+			rpc,
+			ranged_descriptors,
+			ranged_by_parent,
+			imported_by_pubkey,
+			utxo_addresses,
+			wif_prefix,
+		)
+		utxo_errors.extend(extraction_errors)
+		print(f"→ {len(utxo_requests)} UTXO private descriptors extracted")
+		rescan_metadata = build_rescan_metadata(
+			rpc,
+			chain,
+			inventory_tip,
+			oldest_name_height,
+			oldest_utxo_height,
+		)
+
+		output_existed = {path: path.exists() for path in output_files}
+		removed: list[Path] = []
+		if hd_requests:
+			staged.append((stage_json_lines(HD_OUTPUT_FILE, hd_requests), HD_OUTPUT_FILE))
+		else:
+			removed.append(HD_OUTPUT_FILE)
+		if name_requests:
+			staged.append((stage_descriptor_lines(NAME_OUTPUT_FILE, name_requests), NAME_OUTPUT_FILE))
+		else:
+			removed.append(NAME_OUTPUT_FILE)
+		if utxo_requests:
+			staged.append((stage_json_lines(UTXO_OUTPUT_FILE, utxo_requests), UTXO_OUTPUT_FILE))
+		else:
+			removed.append(UTXO_OUTPUT_FILE)
+		staged.append(
+			(stage_json_lines(RESCAN_METADATA_FILE, [rescan_metadata]), RESCAN_METADATA_FILE)
+		)
+		for errors, path in (
+			(name_errors, UNEXTRACTED_NAME_FILE),
+			(utxo_errors, UNEXTRACTED_UTXO_FILE),
+		):
+			if errors:
+				staged.append((stage_text_lines(path, errors), path))
+			else:
+				removed.append(path)
+		commit_staged_files(staged, tuple(removed))
+		staged.clear()
+		print(
+			f"→ Rescan start height {rescan_metadata['start_height']:,} saved in "
+			f"{RESCAN_METADATA_FILE.name}"
+		)
+
+		if name_errors:
+			print(
+				f"→ {len(name_errors):,} names could not be extracted "
+				f"(check {UNEXTRACTED_NAME_FILE.name})",
+				file=sys.stderr,
+			)
+		if utxo_errors:
+			print(
+				f"→ {len(utxo_errors):,} UTXOs could not be extracted "
+				f"(check {UNEXTRACTED_UTXO_FILE.name})",
+				file=sys.stderr,
+			)
+		for label, records, path in (
+			("HD", hd_requests, HD_OUTPUT_FILE),
+			("Name", name_requests, NAME_OUTPUT_FILE),
+			("UTXO", utxo_requests, UTXO_OUTPUT_FILE),
+		):
+			if not records and output_existed[path]:
+				print(f"→ Stale {label} descriptor file removed: {path.name}")
+	finally:
+		for temporary_path, _final_path in staged:
+			remove_private_temporary_file(temporary_path)
+		clear_private_descriptor_data(hd_requests)
+		clear_private_descriptor_data(name_requests)
+		clear_private_descriptor_data(utxo_requests)
+		ranged_descriptors.clear()
+		ranged_by_parent.clear()
+		imported_by_pubkey.clear()
+		had_private_data = isinstance(private_data, (dict, list))
+		clear_private_descriptor_data(private_data)
+		if had_private_data:
+			print("Temporary private descriptor data released (best-effort).")
+
+def run_export() -> None:
+	output_files = (
+		HD_OUTPUT_FILE,
+		NAME_OUTPUT_FILE,
+		UTXO_OUTPUT_FILE,
+		RESCAN_METADATA_FILE,
+		UNEXTRACTED_NAME_FILE,
+		UNEXTRACTED_UTXO_FILE,
+	)
+	validate_output_directory(output_files)
+	rpc: RpcClient | None = None
+	try:
+		rpc = RpcClient()
+		export_wallet_data(rpc, output_files)
+	finally:
+		if rpc is not None:
+			rpc.close()
+
+def main() -> int:
+	remove_bytecode_cache()
+	try:
+		run_export()
+	except (ToolError, ValueError, OSError) as exc:
+		print(f"ERROR: {exc}", file=sys.stderr)
+		return 1
+	print("Done!")
+	return 0
+
+def run_cli() -> int:
+	try:
+		exit_code = main()
+	except KeyboardInterrupt:
+		print("\nOperation cancelled.", file=sys.stderr)
+		exit_code = 130
+	except Exception:
+		traceback.print_exc()
+		exit_code = 1
+	wait_for_close()
+	return exit_code
+
+if __name__ == "__main__":
+	raise SystemExit(run_cli())

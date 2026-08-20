@@ -28,7 +28,7 @@
   --------------------------
   On Windows 11, C:\Program Files is protected by default. Open Command Prompt or PowerShell as Administrator and grant the local account full control over the daemon folder before running the tools:
 
-	  icacls "C:\Program Files\Bitcoin\daemon" /grant "Administrator:(OI)(CI)F" /T
+	  icacls "C:\Program Files\Namecoin\daemon" /grant "%username%:(OI)(CI)F" /T
 
 
   On-chain Archive:

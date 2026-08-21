@@ -270,12 +270,18 @@
   Usage:
   ------
   Run `GET_privkey.py` with the hardcoded `DEFAULT_NAME` (line 30 of the script). Alternatively, run in the console:
+  
+```cmd
+python GET_privkey.py NAME_HEX
+```
 
-	python GET_privkey.py NAME_HEX
-  ---
-	python GET_privkey.py "d/test" --name-encoding ascii
-  ---
-	python GET_privkey.py --address ADDRESS
+```cmd
+python GET_privkey.py "d/test" --name-encoding ascii
+```
+
+```cmd
+python GET_privkey.py --address ADDRESS
+```
 
   Options:
   --------

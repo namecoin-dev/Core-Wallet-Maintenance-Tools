@@ -55,27 +55,27 @@
 
 	Data directory locations:
 
-		Windows (fresh Core v0.28 or newer installation):
-		________________________________________________
+	Windows (fresh Core v0.28 or newer installation):
+	________________________________________________
 
-			%LocalAppData%\Bitcoin
+		%LocalAppData%\Bitcoin
 
-		Windows (existing legacy data directory):
-		_________________________________________
+	Windows (existing legacy data directory):
+	_________________________________________
 
-			%AppData%\Bitcoin
-
-
-		macOS (enable visibility with 'command chflags nohidden ~/Library' in the terminal before):
-		___________________________________________________________________________________________
-
-			~/Library/Application Support/Bitcoin/
+		%AppData%\Bitcoin
 
 
-		Linux:
-		______
+	macOS (enable visibility with 'command chflags nohidden ~/Library' in the terminal before):
+	___________________________________________________________________________________________
 
-			$HOME/.bitcoin/
+		~/Library/Application Support/Bitcoin/
+
+
+	Linux:
+	______
+
+		$HOME/.bitcoin/
 
 ---
 

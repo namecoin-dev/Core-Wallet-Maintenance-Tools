@@ -1,6 +1,6 @@
 ####################################################################################
 ##                                                                                ##
-##                         Core Wallet Maintenance Tools                          ##
+##                     Namecoin Core Wallet Maintenance Tools                     ##
 ##                                                                                ##
 ##            Website: www.namecoin.pro | Web3 ID: https://dotbit.app             ##
 ##                                                                                ##

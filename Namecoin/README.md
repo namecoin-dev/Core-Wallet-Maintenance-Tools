@@ -1,5 +1,5 @@
 
-# Core Wallet Maintenance Tools
+# Namecoin Core Wallet Maintenance Tools
 
 ## Website: [www.namecoin.pro](http://www.namecoin.pro) | Web3 ID: [https://dotbit.app](https://dotbit.app)
 
@@ -55,27 +55,27 @@
 
 	Data directory locations:
 
-		Windows (fresh Core v0.28 or newer installation):
-		________________________________________________
+	Windows (fresh Core v0.28 or newer installation):
+	________________________________________________
 
-			%LocalAppData%\Namecoin
+		%LocalAppData%\Namecoin
 
-		Windows (existing legacy data directory):
-		_________________________________________
+	Windows (existing legacy data directory):
+	_________________________________________
 
-			%AppData%\Namecoin
-
-
-		macOS (enable visibility with 'command chflags nohidden ~/Library' in the terminal before):
-		___________________________________________________________________________________________
-
-			~/Library/Application Support/Namecoin/
+		%AppData%\Namecoin
 
 
-		Linux:
-		______
+	macOS (enable visibility with 'command chflags nohidden ~/Library' in the terminal before):
+	___________________________________________________________________________________________
 
-			$HOME/.namecoin/
+		~/Library/Application Support/Namecoin/
+
+
+	Linux:
+	______
+
+		$HOME/.namecoin/
 
 ---
 

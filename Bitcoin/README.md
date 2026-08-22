@@ -66,7 +66,7 @@
 		%AppData%\Bitcoin
 
 
-	macOS (enable visibility with 'command chflags nohidden ~/Library' in the terminal before):
+	macOS (enable visibility with `command chflags nohidden ~/Library` in the terminal before):
 	___________________________________________________________________________________________
 
 		~/Library/Application Support/Bitcoin/
@@ -88,7 +88,7 @@
 
   1. **Keys that were imported from legacy wallets**
 
-	  Assets imported via raw private keys (by constructing descriptors using the Core Wallet Migration Tools) appear as **simple single-key descriptors** (`wpkh(pubkey)`, `pkh(pubkey)`, ...) and need to be exported by **replacing the public key inside the descriptor with the derived WIF private key**. Their private WIF keys are matched to the corresponding wallet addresses.
+	  Assets imported via raw private keys (by constructing descriptors using the [Core Wallet Migration Tools](https://github.com/namecoin-dev/Core-Wallet-Migration-Tools)) appear as **simple single-key descriptors** (`wpkh(pubkey)`, `pkh(pubkey)`, ...) and need to be exported by **replacing the public key inside the descriptor with the derived WIF private key**. Their private WIF keys are matched to the corresponding wallet addresses.
 
   2. **Keys that were generated internally through descriptor-based key derivation**
 
@@ -101,7 +101,7 @@
   ### Address Collection
 
   * Retrieves current UTXOs for which `listunspent 0` reports both `spendable=true` and `solvable=true` (the wallet knows the spending script and has the private keys).
-  * Intentionally uses one HTTP session with credentials, with one RPC call at a time, in order to efficiently request and verify thousands of UTXO outputs.
+  * Intentionally uses one HTTP session with one RPC call at a time, in order to efficiently request and verify thousands of UTXO outputs.
   * Stores the block height of the oldest transaction output of the exported UTXOs in the `rescan_start.json` file (with a safety buffer of six preceding blocks), to be processed by the `IMPORT_descriptors_direct.py` tool.
 
   ### Safety & Validation
